@@ -10,70 +10,79 @@ visible control over the world - while charging a small, growing cost for
 pressing nothing at all. There is no reward for merely staying alive, because
 that is what teaches a bot to sit still.
 
-QUICK START
-  python bot1.py --calibrate    # teach it which keys it may press (F8 to start/stop)
-  python bot1.py --watch        # record yourself playing and learn from it
-                                # (the bot sends NO input while you play)
-  python bot1.py                # train, and keep training until you stop it
-  python bot1.py --watch --then-train   # ...or let it take over after watching
-  python bot1.py --steps 50000  # ...or stop after a fixed number of steps
+RUNNING IT
+  python bot1.py --calibrate   # teach it which keys it may press (F8 to start/stop)
+  python bot1.py               # play, watch you take over, and keep training
 
-It runs forever by default: F10 quits cleanly (saving a checkpoint first) and
-Ctrl+C does the same, and the next launch resumes from the newest checkpoint.
+Those are the only two commands. Everything else is a constant in SECTION 0
+near the top of this file (audio mode, hotkeys, checkpointing, window
+selection, machine load, the human-takeover timings); edit those and re-run.
+--calibrate is the single command-line option that is left.
 
-That is the whole thing. It picks the game window (auto-detecting a likely
-game, or from a list you choose), captures only that window's video and audio,
-and drives the game with real keyboard and mouse input. Everything you might
-want to change is a constant in SECTION 0 near the top of this file (audio
-mode, hotkeys, checkpointing, window selection, steps, machine load).
-Command-line flags exist only to override those for a single run -
-`python bot1.py --help` lists them.
+`python bot1.py` is the whole thing. It picks the game window (auto-detecting
+a likely game, or from a list you choose), captures only that window's video
+and audio, drives the game with real keyboard and mouse input, and trains
+forever: F10 quits cleanly (saving a checkpoint first), Ctrl+C does the same,
+and the next launch resumes from the newest checkpoint automatically.
 
-THE THREE MODES
-  1. --calibrate  Learns the whitelist of input the bot is allowed to use.
-     Choose the window from the list, press F8, play for a while using every
-     key and mouse button you want it to be able to use, press F8 again. It
-     writes keymap.json with each key, its virtual-key code, how many times you
-     pressed it and how long you held it. Any press shorter than
-     CALIBRATE_MIN_HOLD is reported but left out so a stray tap does not end up
-     in the bot's repertoire. The same pass measures your mouse-look and stores
-     the average pixels-per-step turn it will use.
-     Re-run it any time you rebind something; by default it *merges* into the
-     existing keymap (use --fresh-keymap to start from the built-in defaults).
+THE BOT GETS OUT OF YOUR WAY
+  The moment you touch the keyboard or the mouse, the bot hands the game back
+  to you: it lets go of every button it was holding, stops moving the mouse,
+  and sends nothing at all for as long as you are playing. You do not press
+  anything to make that happen - any real key press, mouse button or mouse
+  movement does it. The bot can tell your input from its own because Windows
+  flags injected input: everything SendInput generates arrives at the
+  low-level hooks with LLKHF_INJECTED / LLMHF_INJECTED set, and your hardware
+  does not.
 
-  2. --watch  Records you playing and learns from it, WITHOUT driving the game
-     while you play. Pick the window, press F8, play, press F8 again. Frames go
-     to <watch-dir>/frames.bin and every key press, mouse button and raw mouse
-     delta to <watch-dir>/events.jsonl. Any key you use that is not in the
-     keymap is added on the fly and saved. Afterwards the recorded button
-     combinations become new actions and the policy is warmed up by behavioral
-     cloning on (frames -> what you were holding and how you turned).
-     The bot sends no input during recording or during that imitation pass, so
-     nothing fights your controls. Letting it drive again is a separate,
-     opt-in phase: add --then-train, and it counts down (HANDOFF_SECONDS,
-     cancellable with the toggle key) before PPO starts so you can let go of
-     the keyboard first. --record-only saves the recording and stops.
+  HUMAN_RELEASE_GRACE_SECONDS (3 seconds) after your last input, it takes the
+  controls back and carries on training. While it was watching you it recorded
+  the frames and exactly what you pressed and how you turned, and it imitates
+  that recording - see "HOW IT LEARNS FROM YOU" below.
 
-  3. (no flag)  Plain PPO training on the calibrated action set, with no step
-     limit: it keeps going until you stop it (F10 or Ctrl+C, both of which
-     checkpoint first). Pass --steps N if you want a finite run.
+  This is the old --watch mode, folded into the training run: there is no
+  separate pass to start, no countdown, and no prompt.
+
+CALIBRATION
+  --calibrate is how the bot learns which buttons it may ever use. Choose the
+  window from the list, press F8, play for a while using every key and mouse
+  button you want it to be able to use, press F8 again. It writes keymap.json
+  with each key, its virtual-key code, how many times you pressed it and how
+  long you held it. Any press shorter than CALIBRATE_MIN_HOLD is reported but
+  left out so a stray tap does not end up in the bot's repertoire. The same
+  pass measures your mouse-look and stores the average pixels-per-step turn it
+  will use. Re-run it any time you rebind something; by default it *merges*
+  into the existing keymap (set CALIBRATE_FRESH_KEYMAP = True to start from the
+  built-in defaults).
+
+  The action space is built from that keymap and is then frozen for the life of
+  the checkpoints: it is what the policy head is sized to, and a checkpoint is
+  only resumable while it still matches. Buttons you press while playing that
+  the keymap does not know are discovered, added to keymap.json and saved, but
+  they only join the action set the next time it is rebuilt with --calibrate
+  (which starts a fresh policy, as changing the action space always does).
+
+HOW IT LEARNS FROM YOU
+  Every takeover is recorded as (frame -> the buttons you were holding and how
+  far you turned) and appended to a rolling buffer of HUMAN_REPLAY_MAX_FRAMES
+  frames. After each PPO update the model takes one extra gradient step towards
+  reproducing those labels, on a class-weighted cross-entropy so "press
+  nothing" cannot win, scaled by HUMAN_IMITATION_WEIGHT. It is a nudge, not a
+  takeover of the update: PPO still owns the objective. Anything you did that
+  this run's action set cannot express is reported and skipped rather than
+  learned wrong.
+
+  The buffer lives in memory for the session. It is not checkpointed: it is a
+  short-term "do what I just showed you" signal, not part of the policy.
 
 TRAINING FOR AS LONG AS YOU WANT
-  There is no end to a run by default. Everything that made a long run safe
-  still happens: a checkpoint every CHECKPOINT_INTERVAL_SEC (newest 3 kept plus
-  a rolling 'last.pt'), a pause hotkey, and a clean save on quit or interrupt.
-  Because resume is on by default, ``python bot1.py`` after a stop simply
-  continues from the newest checkpoint instead of starting over - so "forever"
-  survives reboots and crashes as well as graceful exits.
-
-WHO SENDS INPUT, AND WHEN
-  Only two phases ever drive the game: plain training, and the optional
-  --then-train phase of --watch. Everything else - the window picker, capture,
-  calibration, recording, and the imitation pass - touches nothing. That
-  matters most for --watch, where the game is yours: the bot deliberately has
-  no way to press a key while you play or while it learns from your play, and
-  it announces a cancellable countdown (HANDOFF_SECONDS) before it is allowed
-  to take the controls back.
+  There is no end to a run. Everything that made a long run safe still happens:
+  a checkpoint every CHECKPOINT_INTERVAL_SEC (newest 3 kept plus a rolling
+  'last.pt'), a pause hotkey, and a clean save on quit or interrupt. Because
+  resume is on by default, running the script again simply continues from the
+  newest checkpoint instead of starting over - so "forever" survives reboots
+  and crashes as well as graceful exits. Set TOTAL_STEPS to a number if you
+  want a finite run.
 
 WHY CALIBRATION MATTERS
   The bot can only ever press keys that are in keymap.json, and the action
@@ -81,8 +90,7 @@ WHY CALIBRATION MATTERS
   down, plus optionally a tap, a click and a relative mouse turn. So after
   calibration, "hold forward and run" or "hold forward while clicking" are
   single decisions the policy can learn, and the bot can hold a button down
-  for as long as it wants instead of re-tapping it. Print the list with
-  `python bot1.py --print-actions`.
+  for as long as it wants instead of re-tapping it.
 
 SEEING AND REACTING QUICKLY
   Reaction time is set by how often the bot can grab a frame and act on it:
@@ -99,8 +107,9 @@ DEDICATED MACHINE
     * mouse-look works, because games read look from raw mouse deltas and only
       real cursor movement produces those,
     * the bot re-asserts focus on the target window before each action.
-  If you also want to use the machine while it trains, the game loses focus and
-  input stops landing. Use a VM or a second machine.
+  If you also want to use the machine for something else while it trains, the
+  game loses focus and input stops landing - but the bot notices you touching
+  the keyboard or mouse and stops trying, so it will not fight you.
 
 Components:
   1. Visual capture via PrintWindow of the target window.
@@ -116,9 +125,8 @@ Components:
      picker you can always fall back on.
   8. Global hotkeys, rolling checkpoints every 5 minutes (keeps latest 3),
      a guaranteed save on Ctrl+C, and automatic resume on the next launch.
-  9. Key calibration and human-play recording (--calibrate / --watch) with a
-     discrete action space built from your own keymap, including held buttons,
-     plus behavioral-cloning warm starts from your play.
+  9. Key calibration, plus live human-takeover detection and imitation of your
+     play inside the training loop.
 
 Requirements:
   pip install torch numpy opencv-python pywin32 gymnasium prodigyopt proc-tap
@@ -126,18 +134,15 @@ Requirements:
   'soundcard' is optional, used only for the system-wide audio fallback.
 
 Hotkeys (global, work regardless of which window is focused):
-  F8  - pause / resume the bot (also the --calibrate / --watch toggle)
+  F8  - pause / resume the bot (also the --calibrate start/stop toggle)
   F9  - save a checkpoint right now
   F10 - quit cleanly (saves a checkpoint first)
   Ctrl+C in the console - quit cleanly (saves a checkpoint first)
 
 Keymap:
   keymap.json is the whitelist of input the bot may use, written by
-  --calibrate and read by every mode. Delete it to fall back to the built-in
+  --calibrate and read by every run. Delete it to fall back to the built-in
   defaults (WASD, space, shift, ctrl, the number keys, Q/E and the mouse).
-  The action list is derived from it, so a checkpoint is only resumable while
-  the keymap keeps the same action space; changing it makes the script start
-  fresh rather than fail on a shape mismatch.
 
 Checkpoints:
   Saved to .\\checkpoints\\ as checkpoint_<seq>_step<N>_<timestamp>.pt, plus a
@@ -145,15 +150,15 @@ Checkpoints:
   timestamped checkpoints are kept; older ones are deleted automatically.
   Each checkpoint holds the model, optimizer, intrinsic-reward nets, step
   counter, rollout buffers and RNG state, so the next run resumes from it
-  automatically (set RESUME_ON_START = False, or pass --no-resume, to opt out).
+  automatically (set RESUME_ON_START = False to opt out).
 
 Running and watching:
   - Leave the game window restored and focused. PrintWindow returns black for
     minimized windows, and SendInput only reaches the focused window.
   - The script drops its own CPU priority below normal (PRIORITY constant) so
     frame capture does not fight the game.
-  - Set SHOW_PREVIEW = True (or pass --preview) for a small live view of what
-    the model sees. On a dedicated machine, put it on a second monitor.
+  - Set SHOW_PREVIEW = True for a small live view of what the model sees. On a
+    dedicated machine, put it on a second monitor.
   - If it feels sluggish, lower IMG_SIZE or TARGET_FPS, raise CAPTURE_DELAY,
     or set DEVICE = "cpu" to move the model off a busy GPU. Watch the [Perf]
     line, which reports the steps/s actually achieved.
@@ -177,15 +182,12 @@ A GAME THAT PAUSES WHEN UNFOCUSED:
   using. The training loop also warns automatically when the captured image
   stops changing (FROZEN_WARN_SECONDS), which is the symptom to look for.
 
-  If training ever looks useless, run:
-
-      python bot1.py --diag-capture     # are the grabbed pixels live?
-      python bot1.py --diag-input       # does the game react to our input?
-
-  --diag-capture reports LIVE/FROZEN/BLACK. --diag-input taps a key (E, which
-  opens the inventory in most survival games - change the key if yours differs)
-  and reports whether the game reacted. The training loop also warns
-  automatically when the captured image stops changing (FROZEN_WARN_SECONDS).
+  If training ever looks useless, set DIAGNOSTIC in SECTION 0 to one of
+  "capture", "input", "safety", "release", "windows" or "actions" and run the
+  script again. That is where the old --diag-capture / --diag-input /
+  --diag-watch-safety / --release-keys / --list-windows / --print-actions
+  checks live now: they are settings instead of flags, because the only flag
+  left is --calibrate.
 
 Notes:
   - This assumes a machine dedicated to the bot. The game window owns the
@@ -194,8 +196,11 @@ Notes:
     mouse-look work: games read look from raw mouse deltas, which only
     exist for real cursor movement. The bot re-asserts focus on the target
     window before each action.
-  - If you also want to use the machine while it trains, the game loses focus
-    and input stops landing. Use a dedicated machine/VM.
+  - Yield detection counts real mouse *movement* as "you took over", which is
+    what you want while you are playing. If your game re-centres the cursor
+    itself and that arrives as an un-injected move, the bot will read it as you
+    touching the mouse: set HUMAN_MOUSE_TAKEOVER = False to make only keys and
+    buttons hand the controls over.
   - The reward is fully game-agnostic. It does not read health, score, or
     any game-specific state. It pays for finding unseen (screen, action)
     combinations, for trying an action where it has not been tried, and for
@@ -303,30 +308,27 @@ RESUME_ON_START = True             # continue from the newest checkpoint if pres
 # ---- window selection ------------------------------------------------------
 # None = auto-detect a likely game window, or show the interactive picker when
 # nothing looks like a game.
-# An int = use that hwnd directly (find one with --list-windows).
+# An int = use that hwnd directly (set DIAGNOSTIC = "windows" to list them).
 TARGET_WINDOW_HWND = None
 # True  = auto-target the largest likely game window without prompting.
-# False = always show the picker. --pick / --select force the picker per run.
+# False = always show the interactive picker instead.
 PREFER_GAME_WINDOW = True
 
 # ---- training / machine load ----------------------------------------------
-# The bot trains forever by default. TOTAL_STEPS is only the fallback target for
-# a finite run (`--steps N`), and "forever" is expressed as an unreachable step
-# count so the loop keeps resuming, checkpointing and printing stats exactly as
-# it always did. Stop it with F10 (clean quit + checkpoint) or Ctrl+C; both save
-# first, and the next launch resumes automatically.
+# The bot trains forever by default. TOTAL_STEPS is the only step target, and
+# "forever" is expressed as an unreachable step count so the loop keeps
+# resuming, checkpointing and printing stats exactly as it always did. Stop it
+# with F10 (clean quit + checkpoint) or Ctrl+C; both save first, and the next
+# launch resumes automatically. Set TOTAL_STEPS to a number for a finite run.
 FOREVER = "forever"
 FOREVER_STEPS = 10 ** 12            # effectively unlimited: ~1000 years at 30 Hz
 TOTAL_STEPS = FOREVER              # forever | an int, e.g. 100_000
-# Distinguishes "the user did not pass --steps" from "the user passed a value",
-# so --forever and --steps N can coexist without one overriding the other.
-SUPPRESS_STEPS = object()
 BATCH_SIZE = 8
 # Control rate. TARGET_FPS is the wall-clock ceiling on how often the bot sees
-# the screen and can act; CAPTURE_DELAY is an extra sleep on top of that (set
-# --capture-delay to override both). At 160px/30Hz the loop reacts in about
-# 33 ms, which is fast enough to answer most things a game throws at you. Raise
-# CAPTURE_DELAY or lower TARGET_FPS if the game stutters (watch the [Perf] line).
+# the screen and can act; CAPTURE_DELAY is an extra sleep on top of that. At
+# 160px/30Hz the loop reacts in about 33 ms, which is fast enough to answer most
+# things a game throws at you. Raise CAPTURE_DELAY or lower TARGET_FPS if the
+# game stutters (watch the [Perf] line).
 TARGET_FPS = 30.0
 CAPTURE_DELAY = 0.0                # extra seconds slept between steps
 IMG_SIZE = 160
@@ -334,6 +336,8 @@ SEQ_LEN = 8
 DEVICE = "auto"                    # auto | cuda | cpu
 PRIORITY = "below_normal"          # below_normal | normal | high
 SHOW_PREVIEW = False               # small live view of what the model sees
+ENABLE_HOTKEYS = True              # global pause / save / quit hotkeys
+RUN_STARTUP_TESTS = True           # capture/audio/input checks at startup
 
 # ---- frozen-window watchdog -------------------------------------------------
 # Warn when screen-grab frames stop changing for this long. Many games stop
@@ -348,11 +352,13 @@ FROZEN_WARN_SECONDS = 15.0
 # taps the action set defines (a menu key, a slot key, jump) and to clicks.
 ACTION_TAP_SECONDS = 0.06
 
-# Global injection switch, checked by every SendInput call. Modes where the
-# game must stay yours (--watch recording and learning, --calibrate) turn this
-# off for their whole duration, so no code path can press a key behind your
-# back. Leave it alone unless you are debugging: set INJECTION_AUDIT to True to
-# dump a stack trace whenever an injection is refused.
+# Global injection switch, checked by every SendInput call. --calibrate turns
+# this off for its whole duration, so no code path can press a key behind your
+# back while you are demonstrating. Human takeovers do NOT use it: they flip
+# BackgroundInput's own per-instance switch (see Input.suspended) instead, so a
+# yield can be released and re-armed many times without being reported as a
+# bug. Leave this alone unless you are debugging: set INJECTION_AUDIT to True
+# to dump a stack trace whenever an injection is refused.
 INPUT_INJECTION_ENABLED = True
 INJECTION_AUDIT = False
 
@@ -370,12 +376,17 @@ MOUSE_TURN_PIXELS = 60
 
 # ---- keymap / calibration ---------------------------------------------------
 # The JSON whitelist of keys the bot may press. Written by --calibrate, read by
-# every other mode. Delete it to fall back to the built-in defaults.
+# every other run. Delete it to fall back to the built-in defaults.
 KEYMAP_PATH = "keymap.json"
+# The start/stop key --calibrate listens for.
+CALIBRATE_KEY = "f8"
+# True = --calibrate starts from the built-in defaults and ignores the keymap
+# that is already on disk, instead of merging into it.
+CALIBRATE_FRESH_KEYMAP = False
 # Ignore presses shorter than this during --calibrate (a stray tap on a key you
 # do not actually play with). 0.0 records every press.
 CALIBRATE_MIN_HOLD = 0.12
-# How long to wait for the first F8 once --calibrate starts.
+# How long to wait for the first toggle key once --calibrate starts.
 CALIBRATE_WAIT_SECONDS = 300.0
 
 # Virtual keys the recorder refuses to learn and the bot refuses to press.
@@ -384,26 +395,38 @@ CALIBRATE_WAIT_SECONDS = 300.0
 # 0x72 = F3. Extend this if your game has other "do not touch" keys.
 RECORDER_BLOCKED_VKS = {0x70, 0x72}
 
-# ---- watch mode (learning from your play) -----------------------------------
-WATCH_DIR = "human_play"
-WATCH_TARGET_FPS = 30.0            # how often your play is sampled
-WATCH_FRAME_SIZE = 128             # pixels stored per recorded frame (square)
-# Cap on how many recorded steps are kept; 40k at 128px is roughly 2 GB of JPEG.
-WATCH_MAX_STEPS = 40_000
-# Behavior cloning pass over your recording, before PPO takes over.
-BC_EPOCHS = 3
-BC_BATCH_SIZE = 64
-BC_LR = 3e-4
-BC_VALUE_WEIGHT = 0.5              # value-head loss grows to this over the BC pass
-BC_IMITATION_WEIGHT = 1.0
-# How many PPO steps to run after the BC warm start (--watch --then-train).
-# Same convention as TOTAL_STEPS: "forever" by default, or an int for a finite
-# run (--steps N).
-WATCH_PPO_STEPS = FOREVER
-# Once recording and imitation are done, how long to wait before the bot is
-# allowed to touch the controls. This is the gap in which you let go of the
-# keyboard and mouse, so it is deliberately visible and cancellable.
-TRAIN_HANDOFF_SECONDS = 8.0
+# ---- human takeover (the bot hands you the controls and learns from you) ----
+# The moment you touch the keyboard or the mouse, the bot lets go of every
+# button it was holding and sends nothing at all. This is how long it waits
+# after your last input before it takes the controls back.
+HUMAN_RELEASE_GRACE_SECONDS = 3.0
+# Count real mouse *movement* as you taking over. Set this to False if your game
+# re-centres the cursor itself and that arrives as an un-injected move, which
+# would look like you touching the mouse.
+HUMAN_MOUSE_TAKEOVER = True
+# Frames of your play kept in memory to learn from, stored at IMG_SIZE in RGB
+# (~77 KB each at 160px, so 1500 frames is about 115 MB).
+HUMAN_REPLAY_MAX_FRAMES = 1500
+# A takeover with fewer recorded steps than this is not worth imitating.
+HUMAN_SEGMENT_MIN_STEPS = 8
+# Imitation of your play: one extra supervised gradient step after each PPO
+# update, on a minibatch of (frames -> what you did), scaled by this weight. It
+# is a nudge alongside PPO, not a second objective.
+HUMAN_IMITATION_WEIGHT = 0.5
+HUMAN_IMITATION_BATCH_SIZE = 32
+
+# ---- one-shot diagnostics ---------------------------------------------------
+# "" does nothing extra. Otherwise one of:
+#   "capture"  are the grabbed pixels actually live? (BLACK / FROZEN / LIVE)
+#   "input"    does the game react to injected input at all?
+#   "safety"   prove that calibration cannot inject input
+#   "release"  lift every key the bot could have left pressed
+#   "windows"  list every window, for TARGET_WINDOW_HWND
+#   "actions"  print the action list built from the keymap
+# These were command-line flags before --calibrate was left as the only one.
+DIAGNOSTIC = ""
+DIAGNOSTIC_SECONDS = 5.0           # how long "capture" watches for
+DIAG_INPUT_KEY = "E"               # the key "input" taps (inventory in most games)
 
 # ---- calibrated action set --------------------------------------------------
 # Upper bound on distinct button combinations the policy chooses between.
@@ -701,9 +724,9 @@ def find_game_window() -> Optional[int]:
     Auto-detect a likely game window, largest first. Returns an hwnd or None.
 
     This is a convenience, not a requirement: anything not recognised still
-    works, it just has to be chosen from --list-windows / the picker. Known
-    non-games (browsers, editors, terminals) are excluded so the bot never
-    silently targets the wrong window.
+    works, it just has to be chosen from the picker (or pinned with the
+    TARGET_WINDOW_HWND constant). Known non-games (browsers, editors,
+    terminals) are excluded so the bot never silently targets the wrong window.
     """
     candidates = [w for w in enumerate_windows(min_area=1)
                   if looks_like_game(w, strict=True)]
@@ -716,8 +739,11 @@ def find_game_window() -> Optional[int]:
           f"title='{best['title']}'")
     if len(candidates) > 1:
         print(f"[find] ({len(candidates)} candidates; used the largest - "
-              f"run with --pick to choose manually)")
+              f"set TARGET_WINDOW_HWND, or PREFER_GAME_WINDOW = False, to "
+              f"choose yourself)")
     return best["hwnd"]
+
+
 def capture_window_printwindow(hwnd: int) -> Optional[np.ndarray]:
     """
     Capture the client area of a window using PrintWindow.
@@ -764,15 +790,15 @@ def capture_window_printwindow(hwnd: int) -> Optional[np.ndarray]:
 # =============================================================================
 # SECTION 1.5: REAL-TIME INPUT CAPTURE, KEYMAP & CALIBRATED ACTION SETS
 #
-# This is what powers --calibrate and --watch: it listens to the *real* keyboard
-# and mouse (low-level Win32 hooks) so the script can learn which keys you
-# actually play with, and record (frame, buttons, mouse delta) demonstrations
-# of you playing.
+# This is what powers --calibrate (which keys exist) and the human-takeover
+# watcher in SECTION 1.7 (what you did while you had the controls): it listens
+# to the *real* keyboard and mouse through low-level Win32 hooks.
 #
 # It deliberately uses WH_KEYBOARD_LL / WH_MOUSE_LL rather than polling
 # GetAsyncKeyState, because the low-level hooks also deliver raw relative mouse
 # movement - the same signal the game uses for looking around - which polling
-# cannot see.
+# cannot see. Every event also carries an "injected" flag, which is how the bot
+# tells its own SendInput traffic apart from your hands.
 # =============================================================================
 
 # ---- low-level hook plumbing ----
@@ -796,11 +822,17 @@ LLKHF_EXTENDED = 0x01
 LLMHF_INJECTED = 0x00000001
 
 # Virtual-key codes that are not in BackgroundInput.VK but that the recorder
-# needs a name for.
+# needs a name for. The sided modifier codes matter: the low-level hooks report
+# VK_LSHIFT / VK_RSHIFT / VK_LCONTROL / ... (0xA0-0xA5) rather than the generic
+# VK_SHIFT / VK_CONTROL, so without these names a shift or ctrl press would be
+# named "VK_A0" and could never be matched to the LSHIFT / LCTRL entries that
+# the keymap and the default hold keys use.
 _EXTRA_VK_NAMES = {
     0x08: "BACKSPACE", 0x0D: "ENTER", 0x14: "CAPSLOCK", 0x2C: "PRINTSCREEN",
     0x5B: "LWIN", 0x5C: "RWIN", 0x5D: "APPS", 0x90: "NUMLOCK",
-    0x91: "SCROLLLOCK", 0xBA: ";", 0xBB: "=", 0xBC: ",", 0xBD: "-",
+    0x91: "SCROLLLOCK", 0xA0: "LSHIFT", 0xA1: "RSHIFT", 0xA2: "LCTRL",
+    0xA3: "RCTRL", 0xA4: "LALT", 0xA5: "RALT",
+    0xBA: ";", 0xBB: "=", 0xBC: ",", 0xBD: "-",
     0xBE: ".", 0xBF: "/", 0xC0: "`", 0xDB: "[", 0xDC: "\\", 0xDD: "]",
     0xDE: "'",
 }
@@ -874,10 +906,11 @@ class Keymap:
     """
     The bot's whitelist of input, plus a little self-tuning.
 
-    Built once by --calibrate, then reloaded by every run. When a keymap is
-    passed to --watch, any *new* key you press while playing is folded in and
-    written back to disk, so the allowed set grows with you instead of needing
-    a fresh calibration run every time you rebind something.
+    Built once by --calibrate, then reloaded by every run. While a training run
+    is watching you play, any *new* key you press is folded in and written back
+    to disk, so the keymap grows with you instead of needing a fresh
+    calibration run every time you rebind something. (It joins the action set,
+    and so the policy, the next time the keymap is rebuilt by --calibrate.)
     """
 
     VERSION = 1
@@ -1010,7 +1043,7 @@ class Keymap:
         Add (or refresh) a key or mouse button in the whitelist.
 
         Returns True when this call added something new, which is what makes
-        the --watch auto-discovery path easy to report.
+        the human-takeover discovery path easy to report.
         """
         upper = str(name).upper()
         if upper in _MOUSE_BUTTON_NAMES.values():
@@ -1729,7 +1762,7 @@ class InputRecorder:
 
     def _learn(self, name: str):
         """
-        Add a newly-seen key to the whitelist (--watch discovery).
+        Add a newly-seen key to the whitelist (calibration discovery).
 
         New keys default to *hold* rather than *tap*: if you pressed something
         while playing, holding it is the behaviour the bot needs to be able to
@@ -1954,8 +1987,8 @@ class FrameClock:
             return f"[Perf] {hz:5.1f} steps/s"
         line = f"[Perf] {hz:5.1f} steps/s (target {self.target_fps:.0f})"
         if hz < self.target_fps * 0.5:
-            line += ("  <- capture is the bottleneck; raise CAPTURE_DELAY, lower "
-                     "IMG_SIZE, or pass --target-fps lower")
+            line += ("  <- capture is the bottleneck; raise CAPTURE_DELAY or "
+                     "lower IMG_SIZE / TARGET_FPS in SECTION 0")
         return line
 
     def reset(self):
@@ -2040,8 +2073,8 @@ def _run_calibration_locked(target: dict, args) -> int:
         except Exception:
             keymap.game_resolution = [0, 0]
         if existing is not None:
-            print("[Calibrate] --fresh-keymap: starting from the built-in "
-                  "defaults, ignoring the old file.")
+            print("[Calibrate] CALIBRATE_FRESH_KEYMAP is on: starting from the "
+                  "built-in defaults, ignoring the old file.")
 
     print()
     print("=" * 72)
@@ -2160,7 +2193,7 @@ def _run_calibration_locked(target: dict, args) -> int:
         duration = max(1e-6, events.duration())
         events_per_second = len(deltas) / duration
         # If the user barely moved the mouse, do not shrink the turn to nothing.
-        per_step = per_event * max(1.0, events_per_second / WATCH_TARGET_FPS)
+        per_step = per_event * max(1.0, events_per_second / max(1.0, TARGET_FPS))
         per_step = float(np.clip(per_step, 10.0, 400.0))
         keymap.default_mouse_turn = int(round(per_step))
         keymap.note_mouse_turn(per_step)
@@ -2168,7 +2201,7 @@ def _run_calibration_locked(target: dict, args) -> int:
               f"{duration:.1f}s = {events_per_second:.0f}/s, "
               f"{per_event:.0f} px each -> {keymap.default_mouse_turn} px per "
               f"control step.")
-    keymap.samples += max(1, int(duration * WATCH_TARGET_FPS))
+    keymap.samples += max(1, int(duration * max(1.0, TARGET_FPS)))
     keymap.updated = datetime.now().isoformat(timespec="seconds")
     keymap.origin = "calibrated"
 
@@ -2184,8 +2217,8 @@ def _run_calibration_locked(target: dict, args) -> int:
     if rejected:
         print(f"[Calibrate] Ignored {len(rejected)} too-short press(es): "
               f"{', '.join(rejected)}")
-        print(f"[Calibrate] (threshold {min_hold * 1000:.0f} ms; pass "
-              f"--calibrate-min-hold 0 to keep everything)")
+        print(f"[Calibrate] (threshold {min_hold * 1000:.0f} ms; set "
+              f"CALIBRATE_MIN_HOLD = 0 to keep everything)")
     if not allowed:
         print("[Calibrate] No usable keys were recorded; keeping the defaults.")
     _print_key_report(keymap, allowed)
@@ -2204,7 +2237,8 @@ def _run_calibration_locked(target: dict, args) -> int:
     print(f"[Calibrate] Saved keymap -> {saved}")
     print("[Calibrate] The bot now only ever presses those keys. Re-run "
           "--calibrate any time you rebind something.")
-    print("[Calibrate] Next: python bot1.py --watch   (learn from your play)")
+    print("[Calibrate] Next: python bot1.py   (train, and it will watch you "
+          "whenever you take the controls)")
     return 0
 
 
@@ -2215,230 +2249,52 @@ def _calibration_status(recorder: InputRecorder) -> Optional[str]:
             f"{recorder.mouse_events} mouse events")
 
 
-# ---------------------------------------------------------------------------
-# Watch: record your play, then learn from it
-# ---------------------------------------------------------------------------
+# =============================================================================
+# SECTION 1.7: HUMAN TAKEOVER - YIELD THE CONTROLS, WATCH, AND LEARN FROM YOU
+#
+# The bot has to be able to tell *your* input from its own, and it can: every
+# event SendInput generates arrives at the Win32 low-level hooks with
+# LLKHF_INJECTED / LLMHF_INJECTED set, while hardware input does not. That one
+# fact is what makes this feature safe - the bot can watch the raw input stream
+# continuously without ever mistaking its own keystrokes or mouse movement for
+# yours.
+#
+# What happens when you touch the controls:
+#   1. the bot lets go of every button it is holding and stops injecting,
+#   2. it records the frames and exactly what you pressed and how you turned,
+#   3. HUMAN_RELEASE_GRACE_SECONDS (3 s) after your last input it takes the
+#      controls back and imitates what it saw in its next PPO updates.
+#
+# This is the old separate "--watch mode" folded into the training loop: there
+# is no recording session to start, no countdown and no handoff prompt.
+# =============================================================================
 
-class WatchRecorder:
+# KBDLLHOOKSTRUCT.flags bit meaning "this event was injected". (The mouse
+# equivalent, LLMHF_INJECTED, is defined with the other hook constants above.)
+LLKHF_INJECTED = 0x10
+
+
+def build_action_set_for_args(args) -> Tuple[Optional[Keymap], List[dict]]:
     """
-    Records you playing, frame by frame, together with the exact input you
-    gave at each moment.
-
-    Frames go into a length-prefixed JPEG file and the input timeline goes into
-    events.jsonl. Keeping frames on disk rather than in RAM means a long
-    session does not need tens of gigabytes of memory; the behavioral-cloning
-    pass reads them back.
+    Keymap -> action-set pipeline, shared by calibration and training so both
+    always agree on what the bot is allowed to do.
     """
-
-    def __init__(self, directory: str = WATCH_DIR, hwnd: int = 0,
-                 frame_size: int = WATCH_FRAME_SIZE, max_steps: int = WATCH_MAX_STEPS):
-        self.directory = os.path.abspath(directory)
-        os.makedirs(self.directory, exist_ok=True)
-        self.hwnd = hwnd
-        self.frame_size = int(frame_size)
-        self.max_steps = int(max_steps)
-        self.frames_path = os.path.join(self.directory, "frames.bin")
-        self.meta_path = os.path.join(self.directory, "recording.json")
-        self.events_path = os.path.join(self.directory, "events.jsonl")
-        self._fh = None
-        self._events_fh = None
-        self._pending = 0
-        self.timeline = RecordedInput()
-        self.timestamps: List[float] = []
-        self.audio_chunks: List[np.ndarray] = []
-        self.audio_rate = 16000
-        self.bytes_written = 0
-        self.quality = 70
-
-    def open(self) -> bool:
-        try:
-            self._fh = open(self.frames_path, "wb")
-            self._events_fh = open(self.events_path, "w", encoding="utf-8")
-        except OSError as exc:
-            print(f"[Watch] Could not open '{self.frames_path}': {exc}")
-            return False
-        self.timeline = RecordedInput()
-        self.timestamps = []
-        self._pending = 0
-        return True
-
-    def close(self):
-        self.flush_events(force=True)
-        for fh in (self._fh, self._events_fh):
-            if fh is not None:
-                try:
-                    fh.close()
-                except OSError:
-                    pass
-        self._fh = None
-        self._events_fh = None
-
-    def add_frame(self, frame_bgr: Optional[np.ndarray],
-                  t: Optional[float] = None) -> bool:
-        """Store one frame and its timestamp. False means the step cap is hit."""
-        if self._fh is None or len(self.timestamps) >= self.max_steps:
-            return False
-        if frame_bgr is None:
-            return True
-        if (frame_bgr.shape[0] != self.frame_size
-                or frame_bgr.shape[1] != self.frame_size):
-            frame_bgr = cv2.resize(frame_bgr, (self.frame_size, self.frame_size))
-        ok, buf = cv2.imencode(".jpg", frame_bgr,
-                               [int(cv2.IMWRITE_JPEG_QUALITY), self.quality])
-        if not ok:
-            return True
-        blob = buf.tobytes()
-        try:
-            self._fh.write(len(blob).to_bytes(4, "little"))
-            self._fh.write(blob)
-        except OSError:
-            return False
-        self.bytes_written += 4 + len(blob)
-        self.timestamps.append(self.timeline.stamp() if t is None else float(t))
-        return True
-
-    def flush_events(self, force: bool = False):
-        """Write newly-seen input events to events.jsonl from the main loop."""
-        if self._events_fh is None:
-            return
-        events = self.timeline.snapshot()
-        if not force and len(events) - self._pending < 16:
-            return
-        for t, kind, value, pressed in events[self._pending:]:
-            if kind == "mouse_move":
-                payload = {"t": round(t, 5), "kind": kind, "dx": int(value[0]),
-                           "dy": int(value[1])}
-            else:
-                payload = {"t": round(t, 5), "kind": kind, "key": str(value),
-                           "down": bool(pressed)}
-            self._events_fh.write(json.dumps(payload) + "\n")
-        self._pending = len(events)
-        try:
-            self._events_fh.flush()
-        except (OSError, ValueError):
-            pass
-
-    @property
-    def step_count(self) -> int:
-        return len(self.timestamps)
-
-    @property
-    def megabytes(self) -> float:
-        return self.bytes_written / (1024 * 1024)
-
-    def write_meta(self, keymap: Keymap, extra: Optional[dict] = None) -> str:
-        self.flush_events(force=True)
-        duration = max(1e-6, self.timeline.duration())
-        meta = {
-            "version": 1,
-            "created": datetime.now().isoformat(timespec="seconds"),
-            "hwnd": self.hwnd,
-            "frame_size": self.frame_size,
-            "steps": self.step_count,
-            "duration_seconds": round(duration, 2),
-            "target_fps": WATCH_TARGET_FPS,
-            "achieved_fps": round(self.step_count / duration, 2),
-            "frames_file": os.path.basename(self.frames_path),
-            "events_file": os.path.basename(self.events_path),
-            "keymap": {"path": keymap.path, "origin": keymap.origin,
-                       "actions": len(keymap.actions)},
-            "audio": {"rate": self.audio_rate, "chunks": len(self.audio_chunks),
-                      "chunk_samples": (len(self.audio_chunks[0])
-                                        if self.audio_chunks else 0)},
-        }
-        if extra:
-            meta.update(extra)
-        with open(self.meta_path, "w", encoding="utf-8") as fh:
-            json.dump(meta, fh, indent=2)
-        return self.meta_path
-
-    def load_frames(self, limit: Optional[int] = None) -> List[np.ndarray]:
-        """Read the stored JPEG frames back in order."""
-        frames: List[np.ndarray] = []
-        if not os.path.exists(self.frames_path):
-            return frames
-        with open(self.frames_path, "rb") as fh:
-            while True:
-                head = fh.read(4)
-                if len(head) < 4:
-                    break
-                size = int.from_bytes(head, "little")
-                blob = fh.read(size)
-                if len(blob) < size:
-                    break
-                arr = cv2.imdecode(np.frombuffer(blob, dtype=np.uint8),
-                                   cv2.IMREAD_COLOR)
-                if arr is not None:
-                    frames.append(arr)
-                if limit and len(frames) >= limit:
-                    break
-        return frames
-
-    def load_events(self) -> List[Tuple[float, str, object, bool]]:
-        events: List[Tuple[float, str, object, bool]] = []
-        if not os.path.exists(self.events_path):
-            return events
-        with open(self.events_path, "r", encoding="utf-8") as fh:
-            for line in fh:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    payload = json.loads(line)
-                    t = float(payload["t"])
-                    if payload.get("kind") == "mouse_move":
-                        events.append((t, "mouse_move",
-                                       (int(payload.get("dx", 0)),
-                                        int(payload.get("dy", 0))), True))
-                    else:
-                        events.append((t, payload.get("kind", "key"),
-                                       payload.get("key", "?"),
-                                       bool(payload.get("down", True))))
-                except Exception:
-                    continue
-        self.timeline.events = events
-        self._pending = len(events)
-        return events
-
-
-def _add_recorded_actions(keymap: Keymap, timeline: RecordedInput,
-                          cap: int = MAX_ACTIONS) -> int:
-    """
-    Fold the button combinations you actually played with into the action set,
-    so the policy can reproduce them exactly instead of only single presses.
-
-    The comparison is done in hold tokens, because an action that already holds
-    W+D is the same behaviour as a recorded W+D, however it was written down.
-
-    Returns the number of new combinations added.
-    """
-    counts = timeline.button_sets()
-    if not counts:
-        return 0
-    existing = set()
-    for action in keymap.actions:
-        tokens = tuple(_uses_tokens(keymap, (action.get("uses") or [])
-                                    + (action.get("held") or [])))
-        if tokens:
-            existing.add(tuple(sorted(tokens)))
-    ranked = sorted(counts.items(), key=lambda kv: (-kv[1], sorted(kv[0])))
-    added = 0
-    for combo, count in ranked:
-        uses = tuple(_uses_tokens(keymap, combo))
-        if not uses or uses in existing:
-            continue
-        if len(keymap.actions) + added >= cap:
-            break
-        keymap.actions.append({
-            "label": "replay:" + "+".join(
-                _hold_label(keymap, t) for t in uses),
-            "uses": list(uses),
-            "look": None,
-            "count": count,
-        })
-        existing.add(uses)
-        added += 1
-    return added
+    path = os.path.abspath(args.keymap)
+    always_rebuild = bool(getattr(args, "fresh_keymap", False))
+    keymap = Keymap.load(path, required=False)
+    if keymap is None:
+        keymap = Keymap.default()
+        if os.path.exists(path):
+            print(f"[Keymap] '{path}' unusable; falling back to the built-in "
+                  f"default keys. Run --calibrate to create a real one.")
+        else:
+            print(f"[Keymap] No keymap at '{path}'; using the built-in default "
+                  f"keys. Run --calibrate to choose your own.")
+    actions = list(keymap.actions)
+    if always_rebuild or not actions:
+        actions, capped = build_action_set(keymap)
+        keymap.set_actions(actions, capped)
+    return keymap, actions
 
 
 def describe_action(action: dict, keymap: Optional[Keymap] = None) -> str:
@@ -2461,33 +2317,6 @@ def describe_action(action: dict, keymap: Optional[Keymap] = None) -> str:
     return ", ".join(parts) if parts else "do nothing"
 
 
-# Backwards-compatible short name used by the watch/calibrate printouts.
-_describe_action = describe_action
-
-
-def build_action_set_for_args(args) -> Tuple[Optional[Keymap], List[dict]]:
-    """
-    Shared keymap -> action-set pipeline for every mode, so calibrate, watch,
-    training and --print-actions always agree on what the bot can do.
-    """
-    path = os.path.abspath(args.keymap)
-    always_rebuild = bool(getattr(args, "fresh_keymap", False))
-    keymap = Keymap.load(path, required=False)
-    if keymap is None:
-        keymap = Keymap.default()
-        if os.path.exists(path):
-            print(f"[Keymap] '{path}' unusable; falling back to the built-in "
-                  f"default keys. Run --calibrate to create a real one.")
-        else:
-            print(f"[Keymap] No keymap at '{path}'; using the built-in default "
-                  f"keys. Run --calibrate to choose your own.")
-    actions = list(keymap.actions)
-    if always_rebuild or not actions:
-        actions, capped = build_action_set(keymap)
-        keymap.set_actions(actions, capped)
-    return keymap, actions
-
-
 def _extract_look(dx: float, dy: float, turn: int) -> Optional[List[int]]:
     """Map a recorded mouse delta onto one of the four look actions."""
     if abs(dx) < 0.5 and abs(dy) < 0.5:
@@ -2497,23 +2326,23 @@ def _extract_look(dx: float, dy: float, turn: int) -> Optional[List[int]]:
     return [0, -turn] if dy < 0 else [0, turn]
 
 
-class BCDataset:
-    """Frames, held-button sets, turns and returns for one imitation pass."""
+def _uses_tokens(keymap: Keymap, uses) -> List[str]:
+    """
+    Normalise an action's ``uses`` entry to hold tokens.
 
-    def __init__(self):
-        self.frames = None          # (N, H, W, 3) uint8, BGR
-        self.buttons: List[set] = []
-        self.looks: List[Optional[List[int]]] = []
-        self.action_ids = None      # (N,) int64
-        self.sample_weights = None  # (N,) float32
-        self.returns = None         # (N,) float32
-        self.class_weight = None
-        self.class_counts = None
-        self.frame_size = 0
-        self.turn = 0
-
-    def __len__(self) -> int:
-        return 0 if self.frames is None else int(self.frames.shape[0])
+    Recorded button combinations are stored under readable names ("W", "LCTRL")
+    while the action spec compares HOLD_57 / HOLD_A2 tokens, so everything is
+    converted to tokens before matching or comparing.
+    """
+    tokens = []
+    for item in (uses or []):
+        upper = str(item).upper()
+        if upper.startswith("HOLD_") or upper == TRACKED_HOLD.upper():
+            tokens.append(upper)
+            continue
+        vk = keymap.vk(upper) or keymap.button_vk(upper)
+        tokens.append(keymap.hold_name(vk) if vk else upper)
+    return sorted(tokens)
 
 
 class _ButtonLookup:
@@ -2527,6 +2356,7 @@ class _ButtonLookup:
     """
 
     def __init__(self, keymap: Keymap, actions: List[dict]):
+        self.known_tokens: set = set()
         self.exact: Dict[tuple, int] = {}
         self.by_size: Dict[int, Dict[tuple, int]] = {}
         self.noop_id = 0
@@ -2542,9 +2372,16 @@ class _ButtonLookup:
                                       + (action.get("held") or [])))
             if not uses:
                 continue
+            self.known_tokens.update(uses)
             look = tuple(action["look"]) if action.get("look") else ()
+            # setdefault (first registration wins), not assignment: a
+            # "hold W and turn" action also answers for the no-turn key so that
+            # a demonstration of a plain W hold is still matched when no
+            # turn-only action exists - but it must never *replace* the plain
+            # hold action that was registered before it, or every W press would
+            # be imitated as W plus a turn.
             for look_variant in ({look, ()} if look else {()}):
-                self.exact[(uses, look_variant)] = action["id"]
+                self.exact.setdefault((uses, look_variant), action["id"])
                 self.by_size.setdefault(len(uses), {}).setdefault(
                     (uses, look_variant), action["id"])
 
@@ -2589,626 +2426,713 @@ class _ButtonLookup:
         return self.noop_id, False
 
 
-def _uses_tokens(keymap: Keymap, uses) -> List[str]:
+class HumanSegment:
+    """Frames, action labels and statistics from one stretch of your play."""
+
+    def __init__(self):
+        self.frames: List[np.ndarray] = []
+        self.action_ids: List[int] = []
+        self.steps = 0
+        self.distinct = 0
+        self.skipped = 0            # frames whose buttons we cannot express
+        self.inexact = 0            # frames rounded to a subset of what you did
+        self.held_presses = 0
+        self.turn_steps = 0
+        self.labels: Dict[str, int] = {}
+
+    def __len__(self) -> int:
+        return len(self.action_ids)
+
+    def top_labels(self, count: int = 4) -> str:
+        ranked = sorted(self.labels.items(), key=lambda kv: -kv[1])[:count]
+        return ", ".join(f"{name} {100.0 * hits / max(1, self.steps):.0f}%"
+                         for name, hits in ranked)
+
+
+def build_human_replay(frames: List[np.ndarray],
+                       timestamps: List[float],
+                       timeline: RecordedInput,
+                       keymap: Keymap,
+                       actions: List[dict],
+                       min_steps: int = HUMAN_SEGMENT_MIN_STEPS,
+                       ) -> Optional["HumanSegment"]:
     """
-    Normalise an action's ``uses`` entry to hold tokens.
+    Label one stretch of your play: for every recorded frame, which of the
+    bot's actions reproduces the buttons you were holding and how far you
+    turned.
 
-    Recorded button combinations are stored under readable names ("W", "LCTRL")
-    while the action spec compares HOLD_57 / HOLD_A2 tokens, so everything is
-    converted to tokens before matching or comparing.
+    Frames whose buttons this run's action set cannot express at all are
+    dropped rather than rounded to the nearest wrong action; the counts come
+    back in the segment so the caller can report them.
     """
-    tokens = []
-    for item in (uses or []):
-        upper = str(item).upper()
-        if upper.startswith("HOLD_") or upper == TRACKED_HOLD.upper():
-            tokens.append(upper)
-            continue
-        vk = keymap.vk(upper) or keymap.button_vk(upper)
-        tokens.append(keymap.hold_name(vk) if vk else upper)
-    return sorted(tokens)
-
-
-def extract_bc_dataset(recorder: WatchRecorder, keymap: Keymap,
-                       actions: List[dict], frame_size: Optional[int] = None,
-                       gamma: float = 0.99,
-                       progress_every: int = 4000,
-                       fold_in_new_actions: bool = True
-                       ) -> Tuple[Optional[BCDataset], List[dict]]:
-    """
-    Turn a recorded play session into supervised training samples.
-
-    Frames are the inputs; the label for each frame is the action that would
-    reproduce what you were *actually* holding and how far you turned at that
-    moment. Reward-shaped `returns` are computed from the same intrinsic reward
-    the PPO loop uses, which is what lets the value head be trained here too -
-    so the warm-started policy drops straight into PPO.
-
-    Any button combination in the recording that had no matching action is
-    folded into the action set first (when `fold_in_new_actions` is set), and
-    the resulting list is returned alongside the dataset so the caller can
-    drive the game with exactly the actions it just trained on.
-    """
-    history = {}
-    frames = recorder.load_frames()
-    if not frames:
-        print("[BC] The recording contains no frames.")
-        return None, actions
-    events = recorder.load_events()
-    timestamps = list(recorder.timestamps[:len(frames)])
-    if len(timestamps) != len(frames):
-        print(f"[BC] Warning: {len(frames)} frames but {len(timestamps)} "
-              f"timestamps; using the shorter of the two.")
-        count = min(len(frames), len(timestamps))
-        frames = frames[:count]
-        timestamps = timestamps[:count]
-
-    if frame_size and frame_size != frames[0].shape[0]:
-        print(f"[BC] Resizing {len(frames)} frames from "
-              f"{frames[0].shape[0]}px to {frame_size}px for the model.")
-        frames = [cv2.resize(f, (frame_size, frame_size),
-                             interpolation=cv2.INTER_AREA) for f in frames]
-
-    n = len(frames)
-    timeline = RecordedInput()
-    timeline.events = events
-    print(f"[BC] Aligning {n} frames with {len(events)} input events...")
-    button_sets = timeline.active_at(timestamps)
-    deltas = timeline.move_deltas(timestamps)
-    timeline.frame_times = timestamps
-
-    # Any combination you used that has no action yet becomes one now, so the
-    # imitation labels are exact instead of being rounded down to a subset.
-    if fold_in_new_actions:
-        added = _add_recorded_actions(keymap, timeline)
-        if added:
-            actions, capped = build_action_set(keymap)
-            keymap.set_actions(actions, capped)
-            print(f"[BC] Added {added} recorded button combination(s) to the "
-                  f"action set ({len(actions)} actions now).")
-    history["actions"] = actions
+    min_steps = max(2, int(min_steps))
+    if not frames or len(frames) < min_steps:
+        return None
+    times = list(timestamps[:len(frames)])
+    frames = frames[:len(times)] if len(times) != len(frames) else frames
+    if not times:
+        return None
 
     matcher = _ButtonLookup(keymap, actions)
-    noop_id = matcher.noop_id
+    known = matcher.known_tokens
 
+    def expressible(name: str) -> bool:
+        tokens = _uses_tokens(keymap, [name])
+        return bool(tokens) and tokens[0] in known
+
+    button_sets = timeline.active_at(times)
+    deltas = timeline.move_deltas(times)
     turn = max(4, int(keymap.default_mouse_turn))
-    unknown: Dict[frozenset, int] = {}
-    ids = np.empty(n, dtype=np.int64)
-    looks: List[Optional[List[int]]] = [None] * n
-    buttons_out: List[set] = [set()] * n
-    for i in range(n):
-        held = button_sets[i]
-        look = _extract_look(deltas[i][0], deltas[i][1], turn)
+
+    segment = HumanSegment()
+    for i, frame in enumerate(frames):
+        held = button_sets[i] if i < len(button_sets) else set()
+        if any(not expressible(name) for name in held):
+            segment.skipped += 1
+            continue
+        dx, dy = deltas[i] if i < len(deltas) else (0.0, 0.0)
+        look = _extract_look(dx, dy, turn)
         uses = tuple(_uses_tokens(keymap, held))
         action_id, exact = matcher.match(uses, look)
-        if not exact and held:
-            unknown[frozenset(held)] = unknown.get(frozenset(held), 0) + 1
-        ids[i] = action_id
-        looks[i] = look
-        buttons_out[i] = set(held)
-
-    dataset = BCDataset()
-    dataset.frames = np.ascontiguousarray(np.stack(frames, axis=0))
-    dataset.buttons = buttons_out
-    dataset.looks = looks
-    dataset.action_ids = ids
-    dataset.turn = turn
-    dataset.frame_size = dataset.frames.shape[1]
-
-    # Action balance: no-op usually dominates a recording, and an unweighted
-    # cross-entropy would happily learn to do nothing.
-    counts = np.bincount(ids, minlength=len(actions)).astype(np.float64)
-    present = counts > 0
-    weight = np.ones(len(actions), dtype=np.float32)
-    if present.any():
-        weight[present] = (counts[present].sum() / counts[present]) ** 0.5
-        weight[present] /= weight[present].mean()
-    dataset.class_weight = weight
-    dataset.class_counts = counts
-    dataset.sample_weights = weight[ids].astype(np.float32)
-
-    # Discounted step reward, shaped like the intrinsic reward PPO uses: reward
-    # a change on screen that followed an action, small bonus for moving.
-    rewards = np.zeros(n, dtype=np.float32)
-    prev_small = None
-    for i in range(n):
-        frame = dataset.frames[i]
-        small = cv2.resize(frame, (16, 16)).astype(np.float32) / 255.0
-        if prev_small is not None and ids[i] != noop_id:
-            rewards[i] = 0.1 * float(np.abs(small - prev_small).mean()) * 10.0
-        rewards[i] += 0.01
-        prev_small = small
-        if progress_every and i and i % progress_every == 0:
-            print(f"[BC] Scoring reward {i}/{n}...")
-
-    returns = np.zeros(n, dtype=np.float32)
-    running = 0.0
-    for i in range(n - 1, -1, -1):
-        running = rewards[i] + gamma * running
-        returns[i] = running
-    if returns.std() > 1e-6:
-        returns = (returns - returns.mean()) / (returns.std() + 1e-6)
-    dataset.returns = returns
-
-    deltas_arr = np.array([(l[0], l[1]) if l else (0, 0) for l in looks],
-                          dtype=np.float32)
-    print(f"[BC] Dataset: {n} steps, "
-          f"{int((deltas_arr[:, 0] != 0).sum() + (deltas_arr[:, 1] != 0).sum())} "
-          f"turn steps, {int((ids != noop_id).sum())} action steps, "
-          f"{int(present.sum())} distinct actions used.")
-    if unknown:
-        top = sorted(unknown.items(), key=lambda kv: -kv[1])[:5]
-        print("[BC] Note: some button combinations had no matching action and "
-              "were mapped to 'do nothing': "
-              + ", ".join(f"{'+'.join(sorted(k))}({v})" for k, v in top))
-    empty = int((~present).sum())
-    if empty:
-        print(f"[BC] {empty} of {len(actions)} actions never appear in your "
-              f"recording; they start from the policy's default instead.")
-    return dataset, actions
+        if held and not exact:
+            segment.inexact += 1
+        segment.frames.append(frame)
+        segment.action_ids.append(int(action_id))
+        label = (actions[action_id].get("label", "?")
+                 if 0 <= action_id < len(actions) else "?")
+        segment.labels[label] = segment.labels.get(label, 0) + 1
+    if not segment.action_ids:
+        return None
+    segment.steps = len(segment.action_ids)
+    segment.distinct = len(segment.labels)
+    segment.held_presses = len(button_sets)
+    segment.turn_steps = sum(1 for d in deltas if abs(d[0]) > 0.5 or abs(d[1]) > 0.5)
+    return segment
 
 
-def bc_train(dataset: BCDataset,
-             num_actions: int,
-             seq_len: int,
-             frame_size: int,
-             audio_samples: int = 16000,
-             epochs: int = BC_EPOCHS, batch_size: int = BC_BATCH_SIZE,
-             lr: float = BC_LR, device: Optional[torch.device] = None,
-             value_weight: float = BC_VALUE_WEIGHT,
-             imitation_weight: float = BC_IMITATION_WEIGHT,
-             control=None) -> MultiHeadgMLP:
+class HumanReplay:
     """
-    Behavioral cloning: teach the policy to imitate the recorded play.
+    Rolling buffer of your play, used to nudge the policy towards what you did.
 
-    Two losses run together:
-      * imitation - cross-entropy over the action that reproduces what you were
-        holding and how you turned, class-weighted so "do nothing" cannot win;
-      * value - MSE against the discounted intrinsic return, which is what PPO
-        will ask the critic for.
-
-    The value weight ramps up over the pass, so the policy first gets the
-    behaviour right and only then starts being fitted to the reward scale.
-
-    Deliberately takes plain shapes rather than an environment: this function
-    needs no window, no capture and no input path, so imitation can never touch
-    the game you are playing. Only the PPO phase constructs an environment.
-    """
-    if device is None:
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = build_model(seq_len=seq_len, num_actions=num_actions,
-                        frame_size=frame_size, device=device)
-    optimizer = Prodigy(model.parameters(), lr=lr)
-    n = len(dataset)
-    if n < seq_len + 1:
-        print("[BC] Recording is too short to imitate; skipping the warm start.")
-        return model
-
-    import torch.utils.data as torch_data
-
-    class _SeqDataset(torch_data.Dataset):
-        """One sample per step: the seq_len frames ending at that step."""
-
-        def __init__(self, frames, action_ids, returns, window):
-            self.frames = frames
-            self.action_ids = action_ids
-            self.returns = returns
-            self.seq_len = int(window)
-
-        def __len__(self):
-            return max(0, len(self.frames) - self.seq_len)
-
-        def __getitem__(self, index):
-            window = self.frames[index:index + self.seq_len]
-            # BGR (stored) -> RGB, NHWC -> NCHW, exactly what the model wants.
-            visual = torch.from_numpy(
-                np.ascontiguousarray(window[:, :, :, ::-1].transpose(0, 3, 1, 2))
-            ).float()
-            return (visual,
-                    int(self.action_ids[index + self.seq_len - 1]),
-                    float(self.returns[index + self.seq_len - 1]))
-
-    samples = _SeqDataset(dataset.frames, dataset.action_ids, dataset.returns,
-                          seq_len)
-    loader = torch_data.DataLoader(samples, batch_size=batch_size, shuffle=True,
-                                   num_workers=0, drop_last=False)
-    if len(dataset.class_weight) < num_actions:
-        pad = np.ones(num_actions - len(dataset.class_weight), dtype=np.float32)
-        class_weight = np.concatenate([dataset.class_weight, pad])
-    else:
-        class_weight = dataset.class_weight[:num_actions]
-    class_weight_t = torch.tensor(class_weight, dtype=torch.float32, device=device)
-
-    total_steps = max(1, epochs * len(loader))
-    step = 0
-    print(f"[BC] Imitating {n} recorded steps for {epochs} epoch(s) "
-          f"({total_steps} updates, batch {batch_size}).")
-    model.train()
-    for epoch in range(1, epochs + 1):
-        running_loss = 0.0
-        running_acc = 0.0
-        seen = 0
-        for visual, actions, returns in loader:
-            if control is not None:
-                for message in control.service():
-                    print(f"[Control] {message}")
-                if control.paused:
-                    control.wait_while_paused()
-                if control.stop_requested:
-                    print("[BC] Stop requested; ending the imitation pass early.")
-                    model.eval()
-                    return model
-            visual = visual.to(device)
-            actions = actions.to(device)
-            returns = returns.to(device)
-            audio = torch.zeros((visual.shape[0], seq_len, audio_samples),
-                                device=device)
-
-            logits, value = model(visual, audio)
-            imitation = F.cross_entropy(logits, actions, weight=class_weight_t)
-            beta = value_weight * (step / total_steps)
-            value_loss = F.mse_loss(value, returns)
-            loss = imitation_weight * imitation + beta * value_loss
-
-            optimizer.zero_grad()
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-            optimizer.step()
-
-            step += 1
-            running_loss += float(loss.item())
-            with torch.no_grad():
-                running_acc += float((logits.argmax(dim=-1) == actions)
-                                     .float().mean().item()) * len(actions)
-            seen += len(actions)
-            if step % 50 == 0 or step == total_steps:
-                print(f"[BC] epoch {epoch}/{epochs}  update {step}/{total_steps}"
-                      f"  loss={running_loss / max(1, step):.4f}"
-                      f"  match={100.0 * running_acc / max(1, seen):5.1f}%")
-        print(f"[BC] epoch {epoch} done: mean loss "
-              f"{running_loss / max(1, len(loader)):.4f}, imitation match "
-              f"{100.0 * running_acc / max(1, seen):.1f}%")
-    model.eval()
-    print("[BC] Warm start complete: the policy starts out trying to play "
-          "like you did, and PPO takes it from there.")
-    return model
-
-
-class WatchTrainingPlan:
-    """
-    What run_watch_session hands to its caller once recording and imitation are
-    done: a live environment plus everything PPO needs. It exists so the
-    training phase can run after the injection lock is released, instead of
-    nested inside it.
+    Frames are kept at the model's frame size in RGB. `max_frames` bounds
+    memory: 1500 frames of 160x160 RGB is about 115 MB. Nothing here is
+    checkpointed - this is a short-term "do what I just showed you" signal, not
+    part of the policy.
     """
 
-    def __init__(self, env, control, total_steps: int, model=None,
-                 optimizer=None, step: int = 0, traced: bool = False):
+    def __init__(self, frame_size: int, seq_len: int, num_actions: int,
+                 max_frames: int = HUMAN_REPLAY_MAX_FRAMES):
+        self.frame_size = int(frame_size)
+        self.seq_len = max(2, int(seq_len))
+        self.num_actions = max(1, int(num_actions))
+        self.max_frames = max(self.seq_len + 1, int(max_frames))
+        self.frames: List[np.ndarray] = []
+        self.action_ids: List[int] = []
+        self.segments = 0
+        self.steps_added = 0
+        self.steps_skipped = 0
+        self.updates = 0
+        self.last_loss: Optional[float] = None
+        self.last_match: Optional[float] = None
+
+    def __len__(self) -> int:
+        return len(self.frames)
+
+    def add(self, segment: HumanSegment) -> int:
+        """Fold one labelled stretch of play into the buffer."""
+        for frame, action_id in zip(segment.frames, segment.action_ids):
+            if (frame.shape[0] != self.frame_size
+                    or frame.shape[1] != self.frame_size):
+                frame = cv2.resize(frame, (self.frame_size, self.frame_size),
+                                   interpolation=cv2.INTER_AREA)
+            self.frames.append(frame)
+            self.action_ids.append(int(action_id))
+        over = len(self.frames) - self.max_frames
+        if over > 0:
+            del self.frames[:over]
+            del self.action_ids[:over]
+        self.segments += 1
+        self.steps_added += len(segment)
+        self.steps_skipped += segment.skipped
+        return len(segment)
+
+    def ready(self) -> bool:
+        return len(self.frames) >= self.seq_len + 1
+
+    def _class_weights(self, device) -> torch.Tensor:
+        """Class balance for the imitation loss: no-op must not win by default."""
+        counts = np.bincount(np.asarray(self.action_ids, dtype=np.int64),
+                             minlength=self.num_actions).astype(np.float64)
+        weight = np.ones(self.num_actions, dtype=np.float32)
+        present = counts > 0
+        if present.any():
+            weight[present] = (counts[present].sum() / counts[present]) ** 0.5
+            weight[present] /= weight[present].mean()
+        return torch.tensor(weight, dtype=torch.float32, device=device)
+
+    def sample(self, batch_size: int, device):
+        """A minibatch of (sequence, action) pairs ending on random frames."""
+        n = len(self.frames)
+        last = np.random.randint(self.seq_len - 1, n, size=int(batch_size))
+        window = np.stack([
+            np.stack(self.frames[i - self.seq_len + 1:i + 1], axis=0)
+            for i in last
+        ], axis=0)                        # (B, T, H, W, 3) RGB uint8
+        visual = torch.from_numpy(
+            np.ascontiguousarray(window.transpose(0, 1, 4, 2, 3))
+        ).float().to(device)              # (B, T, 3, H, W)
+        actions = torch.tensor([self.action_ids[i] for i in last],
+                               dtype=torch.long, device=device)
+        return visual, actions, self._class_weights(device)
+
+    def imitation_step(self, model, optimizer, device,
+                       weight: float = HUMAN_IMITATION_WEIGHT,
+                       batch_size: int = HUMAN_IMITATION_BATCH_SIZE,
+                       audio_samples: int = 16000) -> bool:
+        """
+        One gradient step towards "do what the human did".
+
+        Deliberately not folded into the PPO epochs: this is a supervised nudge
+        on a small minibatch, scaled by HUMAN_IMITATION_WEIGHT, that keeps the
+        policy pointed at your behaviour without taking the update over.
+        """
+        if not self.ready():
+            return False
+        visual, actions, class_weights = self.sample(batch_size, device)
+        audio = torch.zeros((visual.shape[0], visual.shape[1], audio_samples),
+                            device=device)
+        logits, _value = model(visual, audio)
+        loss = F.cross_entropy(logits, actions, weight=class_weights)
+        optimizer.zero_grad()
+        (float(weight) * loss).backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), 0.5)
+        optimizer.step()
+        with torch.no_grad():
+            match = float((logits.argmax(dim=-1) == actions).float().mean().item())
+        self.updates += 1
+        self.last_loss = float(loss.item())
+        self.last_match = match
+        return True
+
+    def describe(self) -> str:
+        return (f"{len(self.frames)} frame(s) from {self.segments} takeover(s), "
+                f"{self.steps_skipped} skipped as inexpressible")
+
+
+class HumanWatcher:
+    """
+    Watches the real keyboard and mouse for *you*, on its own thread.
+
+    The Win32 low-level hooks must be installed and pumped by the same thread,
+    and that thread has to stay responsive or Windows silently drops them - so
+    they live on a dedicated thread running a message pump, not on the training
+    loop, which can spend seconds inside a PPO update.
+
+    Every event carries an "injected" flag; SendInput sets it and your hardware
+    does not, so the bot's own traffic is filtered out here and a single
+    unflagged key press, click or mouse movement is what hands you the
+    controls.
+    """
+
+    def __init__(self, target_hwnd: int = 0, keymap: Optional[Keymap] = None,
+                 ignored_vks=(), max_frames: int = HUMAN_REPLAY_MAX_FRAMES,
+                 verbose: bool = True):
+        self.target_hwnd = int(target_hwnd or 0)
+        self.keymap = keymap
+        self.verbose = bool(verbose)
+        self.ignored_vks = {int(v) for v in ignored_vks if v}
+        self.max_frames = max(2, int(max_frames))
+        self.events = 0
+        self.new_keys: List[str] = []
+        self.errors: List[str] = []
+
+        self._lock = threading.RLock()
+        self._last_activity = 0.0
+        self._human_pressed: Dict[str, float] = {}
+        self._recent: deque = deque(maxlen=512)
+        self._segment: Optional[RecordedInput] = None
+        self._frames: List[np.ndarray] = []
+        self._frame_times: List[float] = []
+        self._cap_hit = False
+        self._mouse_pos: Optional[Tuple[int, int]] = None
+
+        self._running = False
+        self._ready = threading.Event()
+        self._thread: Optional[threading.Thread] = None
+        self._msg_type = None
+        self._kb_proc = None
+        self._ms_proc = None
+        self._kb_hook_handle = None
+        self._ms_hook_handle = None
+        self._user32 = ctypes.windll.user32
+        self._watch_vks = self._build_watch_vks()
+
+    # ---- lookup ----
+    def _build_watch_vks(self) -> List[int]:
+        """
+        Every key whose live state is worth polling.
+
+        This is the fallback for the case where the OS quietly removes a hook
+        (it does that when the owning thread is slow): if a watched key is
+        physically down and the bot is not the one holding it, it is you.
+        """
+        names = set(DEFAULT_HOLD_KEYS) | set(DEFAULT_TAP_KEYS)
+        if self.keymap is not None:
+            names |= set(self.keymap.keys)
+            names |= set(self.keymap.mouse_buttons)
+        vks = set()
+        for name in names:
+            vk = None
+            if self.keymap is not None:
+                vk = self.keymap.vk(name) or self.keymap.button_vk(name)
+            vk = vk or calibratable_keys().get(str(name).upper())
+            if vk:
+                vks.add(int(vk))
+        for vk in (0x01, 0x02, 0x04):              # mouse buttons
+            vks.add(vk)
+        vks -= self.ignored_vks
+        vks.discard(0)
+        return sorted(vks)
+
+    def _vk_of(self, name: str) -> Optional[int]:
+        if name.startswith("MOUSE_"):
+            return {"MOUSE_LEFT": 0x01, "MOUSE_RIGHT": 0x02,
+                    "MOUSE_MIDDLE": 0x04}.get(name)
+        if self.keymap is not None:
+            vk = self.keymap.vk(name)
+            if vk:
+                return int(vk)
+        return calibratable_keys().get(str(name).upper())
+
+    def _focused(self) -> bool:
+        if not self.target_hwnd:
+            return True
+        try:
+            return self._user32.GetForegroundWindow() == self.target_hwnd
+        except Exception:
+            return True
+
+    # ---- lifecycle ----
+    def start(self) -> bool:
+        """Install the hooks on their own thread. True if the keyboard hook is up."""
+        if self._thread is not None:
+            return self._kb_hook_handle is not None
+        self._running = True
+        self._ready.clear()
+        self._thread = threading.Thread(target=self._thread_main,
+                                        name="HumanWatcher", daemon=True)
+        self._thread.start()
+        self._ready.wait(timeout=3.0)
+        return self._kb_hook_handle is not None
+
+    def stop(self):
+        self._running = False
+        if self._thread is not None:
+            self._thread.join(timeout=2.0)
+            self._thread = None
+
+    def _thread_main(self):
+        try:
+            self._install_hooks()
+        except Exception as exc:
+            self.errors.append(f"hooks: {exc}")
+        finally:
+            self._ready.set()
+        try:
+            while self._running:
+                self._pump()
+                time.sleep(0.002)
+        finally:
+            self._remove_hooks()
+
+    def _install_hooks(self):
+        def keyboard_proc(code, wparam, lparam):
+            try:
+                return self._kb_hook(code, wparam, lparam)
+            except Exception:
+                return 0
+
+        def mouse_proc(code, wparam, lparam):
+            try:
+                return self._ms_hook(code, wparam, lparam)
+            except Exception:
+                return 0
+
+        self._kb_proc = ctypes.WINFUNCTYPE(
+            ctypes.c_ssize_t, ctypes.c_int, ctypes.c_size_t,
+            ctypes.c_ssize_t)(keyboard_proc)
+        self._ms_proc = ctypes.WINFUNCTYPE(
+            ctypes.c_ssize_t, ctypes.c_int, ctypes.c_size_t,
+            ctypes.c_ssize_t)(mouse_proc)
+
+        for label, hook_id, proc, attr in (
+            ("keyboard", WH_KEYBOARD_LL, self._kb_proc, "_kb_hook_handle"),
+            ("mouse", WH_MOUSE_LL, self._ms_proc, "_ms_hook_handle"),
+        ):
+            try:
+                handle = self._user32.SetWindowsHookExW(hook_id, proc, None, 0)
+            except Exception as exc:
+                handle = None
+                self.errors.append(f"{label} hook raised {exc}")
+            if not handle:
+                self.errors.append(f"{label} hook could not be installed")
+            else:
+                setattr(self, attr, handle)
+
+    def _remove_hooks(self):
+        for attr in ("_kb_hook_handle", "_ms_hook_handle"):
+            handle = getattr(self, attr)
+            if handle:
+                try:
+                    self._user32.UnhookWindowsHookEx(handle)
+                except Exception:
+                    pass
+                setattr(self, attr, None)
+        self._kb_proc = None
+        self._ms_proc = None
+
+    def _pump(self):
+        """Drain messages so Windows keeps calling the hook procedures."""
+        msg_type = self._msg_type
+        if msg_type is None:
+            class _MSG(ctypes.Structure):
+                _fields_ = [("hwnd", ctypes.c_void_p), ("message", ctypes.c_uint),
+                            ("wParam", ctypes.c_void_p), ("lParam", ctypes.c_void_p),
+                            ("time", ctypes.c_uint), ("pt_x", ctypes.c_long),
+                            ("pt_y", ctypes.c_long)]
+            msg_type = _MSG
+            self._msg_type = msg_type
+
+        msg = msg_type()
+        while self._user32.PeekMessageW(ctypes.byref(msg), None, 0, 0, 1):
+            self._user32.TranslateMessage(ctypes.byref(msg))
+            self._user32.DispatchMessageW(ctypes.byref(msg))
+
+    # ---- hooks (these run on the watcher thread) ----
+    def _kb_hook(self, code, wparam, lparam):
+        if code == 0:
+            data = ctypes.cast(lparam, ctypes.POINTER(ctypes.c_uint32))
+            vk = int(data[0]) & 0xFF
+            flags = int(data[2])          # vkCode, scanCode, flags, ...
+            if not (flags & LLKHF_INJECTED):
+                self._on_key(vk, wparam in (WM_KEYDOWN, WM_SYSKEYDOWN))
+        return self._user32.CallNextHookEx(None, code, wparam,
+                                           ctypes.c_void_p(lparam))
+
+    def _ms_hook(self, code, wparam, lparam):
+        if code == 0:
+            data = ctypes.cast(lparam, ctypes.POINTER(ctypes.c_long))
+            injected = bool(int(data[3]) & LLMHF_INJECTED)   # pt, mouseData, flags
+            if injected:
+                if int(wparam) == WM_MOUSEMOVE:
+                    # Keep the position baseline current even for our own
+                    # injected moves, so the next real delta is measured from
+                    # where the cursor actually is.
+                    self._note_position((int(data[0]), int(data[1])))
+                return self._user32.CallNextHookEx(None, code, wparam,
+                                                   ctypes.c_void_p(lparam))
+            msg = int(wparam)
+            if msg == WM_MOUSEMOVE:
+                self._on_move((int(data[0]), int(data[1])))
+            else:
+                button = {WM_LBUTTONDOWN: ("left", True),
+                          WM_LBUTTONUP: ("left", False),
+                          WM_RBUTTONDOWN: ("right", True),
+                          WM_RBUTTONUP: ("right", False),
+                          WM_MBUTTONDOWN: ("middle", True),
+                          WM_MBUTTONUP: ("middle", False)}.get(msg)
+                if button:
+                    self._on_button(button[0], button[1])
+        return self._user32.CallNextHookEx(None, code, wparam,
+                                           ctypes.c_void_p(lparam))
+
+    # ---- event handling ----
+    def _note_position(self, point):
+        with self._lock:
+            self._mouse_pos = point
+
+    def _on_key(self, vk: int, pressed: bool):
+        if vk in self.ignored_vks or vk in RECORDER_BLOCKED_VKS:
+            return
+        name = _vk_to_name(vk)
+        now = time.perf_counter()
+        learn = False
+        with self._lock:
+            self._last_activity = now
+            if pressed:
+                repeat = name in self._human_pressed
+                self._human_pressed[name] = now
+                if not repeat:
+                    self._record("key", name, True, now)
+                    # Only grow the keymap from keys pressed *in the game*;
+                    # what you type into another window is not the bot's
+                    # business.
+                    learn = self._focused()
+            else:
+                self._human_pressed.pop(name, None)
+                self._record("key", name, False, now)
+        if learn:
+            self._learn(name)
+
+    def _on_button(self, button: str, pressed: bool):
+        name = _MOUSE_BUTTON_NAMES.get(button)
+        if not name:
+            return
+        now = time.perf_counter()
+        learn = False
+        with self._lock:
+            self._last_activity = now
+            if pressed:
+                repeat = name in self._human_pressed
+                self._human_pressed[name] = now
+                if not repeat:
+                    self._record("mouse_btn", button, True, now)
+                    learn = self._focused()
+            else:
+                self._human_pressed.pop(name, None)
+                self._record("mouse_btn", button, False, now)
+        if learn:
+            self._learn(name)
+
+    def _on_move(self, point):
+        with self._lock:
+            previous = self._mouse_pos
+            self._mouse_pos = point
+        if previous is None or not HUMAN_MOUSE_TAKEOVER:
+            return
+        dx = point[0] - previous[0]
+        dy = point[1] - previous[1]
+        if not dx and not dy:
+            return
+        now = time.perf_counter()
+        with self._lock:
+            self._last_activity = now
+            self._record("mouse_move", (dx, dy), True, now)
+
+    def _record(self, kind: str, value, pressed: bool, t: float):
+        """Append one of your events (caller holds the lock)."""
+        event = (float(t), kind, value, bool(pressed))
+        self._recent.append(event)
+        if self._segment is not None:
+            self._segment.events.append(event)
+        self.events += 1
+
+    def _learn(self, name: str):
+        """
+        Remember a button the calibrated keymap does not know about yet.
+
+        It goes into keymap.json but not into this run's action set: the action
+        space is what the policy head is sized to, so it only changes when the
+        keymap is rebuilt by --calibrate.
+        """
+        if self.keymap is None:
+            return
+        if name.startswith("MOUSE_"):
+            if self.keymap.allow(name, source="discovered"):
+                self.new_keys.append(name)
+                if self.verbose:
+                    print(f"[Human] New mouse button: {name} - it is in the "
+                          f"keymap now, but only joins the action set on the "
+                          f"next --calibrate.")
+            return
+        if self.keymap.allow(name, source="discovered", hold="hold"):
+            self.new_keys.append(name)
+            if self.verbose:
+                print(f"[Human] New key: {name} - it is in the keymap now, but "
+                      f"only joins the action set on the next --calibrate.")
+
+    # ---- state the training loop reads ----
+    def human_active(self, bot_held_vks=(),
+                     grace: float = HUMAN_RELEASE_GRACE_SECONDS) -> bool:
+        """
+        True while the controls are yours: any real input within the last
+        `grace` seconds, or any watched key still physically held that the bot
+        is not itself holding.
+        """
+        now = time.perf_counter()
+        with self._lock:
+            last = self._last_activity
+            held = list(self._human_pressed)
+        if now - last < max(0.0, float(grace)):
+            return True
+
+        bot_held = {int(vk) for vk in bot_held_vks}
+        # A key you hold down sends no further events, so ask the OS directly:
+        # first about the keys we watched you press...
+        for name in held:
+            vk = self._vk_of(name)
+            if vk and vk not in bot_held and (win32api.GetAsyncKeyState(vk) & 0x8000):
+                with self._lock:
+                    self._last_activity = now
+                return True
+        # ...then about every key the bot could press. That sweep is also what
+        # catches a hook the OS quietly dropped, so it runs even when we think
+        # we know what is held - a stale held set must not mask a dead hook.
+        for vk in self._watch_vks:
+            if vk in bot_held:
+                continue
+            if win32api.GetAsyncKeyState(vk) & 0x8000:
+                with self._lock:
+                    self._last_activity = now
+                return True
+        return False
+
+    def pressed_now(self) -> List[str]:
+        with self._lock:
+            return sorted(self._human_pressed)
+
+    # ---- recording one takeover ----
+    def begin_segment(self) -> RecordedInput:
+        """
+        Start recording. A second of recent events is carried over so the
+        frames captured just after the first key press still line up with it.
+        """
+        now = time.perf_counter()
+        with self._lock:
+            segment = RecordedInput()
+            segment.events = [event for event in self._recent
+                              if now - event[0] <= 1.0]
+            self._segment = segment
+            self._frames = []
+            self._frame_times = []
+            self._cap_hit = False
+            self._mouse_pos = None
+        return segment
+
+    def capture(self, frame: Optional[np.ndarray]) -> bool:
+        """Store one frame of your play (only while the game window is focused)."""
+        if frame is None or not self._focused():
+            return False
+        with self._lock:
+            if self._segment is None:
+                return False
+            if len(self._frames) >= self.max_frames:
+                self._cap_hit = True
+                return False
+            self._frames.append(np.ascontiguousarray(frame))
+            self._frame_times.append(time.perf_counter())
+        return True
+
+    def end_segment(self) -> dict:
+        """Stop recording and hand back the frames plus their input timeline."""
+        with self._lock:
+            segment = self._segment
+            out = {"frames": self._frames,
+                   "timestamps": self._frame_times,
+                   "timeline": segment or RecordedInput(),
+                   "cap_hit": self._cap_hit,
+                   "focused": self._focused()}
+            self._segment = None
+            self._frames = []
+            self._frame_times = []
+            self._cap_hit = False
+            self._mouse_pos = None
+        return out
+
+
+class HumanTakeover:
+    """
+    Runs the handover in both directions, one call per training iteration.
+
+    service() returns "human" while the controls are yours - the caller must
+    not collect a PPO transition then - "resumed" on the iteration where the
+    bot takes them back, and "idle" the rest of the time.
+    """
+
+    NOTICE_EVERY = 10.0
+
+    def __init__(self, env, watcher: HumanWatcher):
         self.env = env
-        self.control = control
-        self.total_steps = int(total_steps)
-        self.model = model
-        self.optimizer = optimizer
-        self.step = int(step)
-        self.traced = bool(traced)
+        self.watcher = watcher
+        self.replay = HumanReplay(env.frame_size, env.seq_len,
+                                  env.action_space.n)
+        self.active = False
+        self.takeovers = 0
+        self.steps_watched = 0
+        self._next_notice = 0.0
 
+    # ---- the one call the training loop makes ----
+    def service(self) -> str:
+        if self.watcher.human_active(self.env.held_vks):
+            if not self.active:
+                self._begin()
+            frame = self.env.observe_human_step()
+            if self.watcher.capture(frame):
+                self.steps_watched += 1
+            now = time.perf_counter()
+            if now >= self._next_notice:
+                self._next_notice = now + self.NOTICE_EVERY
+                held = self.watcher.pressed_now()
+                print(f"[Human] watching you play: {self.steps_watched} frame(s) "
+                      f"this takeover"
+                      + (f", holding {', '.join(held)}" if held else ""))
+            return "human"
+        if self.active:
+            self._end()
+            return "resumed"
+        return "idle"
 
-def run_watch_session(target: dict, args) -> int:
-    """
-    --watch: record yourself playing, then optionally let the bot take over.
-
-    Injection is disabled for the whole recording-and-learning lifetime of this
-    function (see InjectionLock), and no game environment exists during that
-    time at all: recording only grabs frames and listens, and imitation is pure
-    supervised learning over the saved frames. There is no input object to
-    reach the game with.
-
-    PPO training - the only part here that drives the game - is a separate,
-    opt-in phase behind a prompt, and it runs *after* the injection lock is
-    released.
-    """
-    plan: Optional[WatchTrainingPlan] = None
-    with InjectionLock("watching you play"):
-        result = _run_watch_session_locked(target, args)
-        if isinstance(result, WatchTrainingPlan):
-            plan = result
-        else:
-            return result
-
-    # ---- past this point the lock is open and the bot may drive the game ----
-    print()
-    print(f"[Training] PPO for {describe_steps(plan.total_steps)} steps"
-          + (" from the imitated policy." if plan.traced else "."))
-    try:
-        plan.control.start()
-        train_ppo(
-            plan.env,
-            total_steps=plan.total_steps,
-            batch_size=args.batch_size,
-            checkpoint_interval=args.checkpoint_interval,
-            keep_checkpoints=args.keep_checkpoints,
-            checkpoint_dir=args.checkpoint_dir,
-            enable_hotkeys=False,      # the controller is already running
-            control=plan.control,
-            final_model_path="background_gmlp_model.pt",
-            initial_model=plan.model,
-            initial_optimizer=plan.optimizer,
-            initial_step=plan.step,
-        )
-    finally:
-        plan.env.close()
-        print("[Done] Environment closed. Hotkeys released.")
-    return 0
-
-
-def _run_watch_session_locked(target: dict, args) -> int:
-    hwnd, pid = target["hwnd"], target["pid"]
-    keymap, actions = build_action_set_for_args(args)
-    toggle_key = args.watch_key or args.calibrate_key
-    _mods, vk = parse_hotkey(toggle_key)
-    watch_dir = os.path.abspath(args.watch_dir)
-
-    # --record-only / --no-train keep watch purely a recording session.
-    then_train = (bool(args.then_train) and not args.record_only
-                  and not args.no_train)
-
-    print()
-    print("=" * 72)
-    print("  WATCH MODE - learn by watching you play")
-    print("=" * 72)
-    print(f"  Target window : {target.get('title')!r} (hwnd={hwnd})")
-    print(f"  Start/stop key: {toggle_key.upper()}")
-    print(f"  Recording to  : {watch_dir}")
-    print(f"  Keymap        : {keymap.path or '(built-in defaults)'} "
-          f"({len(actions)} actions)")
-    print()
-    print("  1. Click the game window so it has focus.")
-    print("  2. Press the start/stop key to BEGIN recording.")
-    print("  3. Play. Any key you use that is not in the keymap yet is added")
-    print("     on the fly - you do not have to calibrate first.")
-    print("  4. Press the start/stop key again to STOP.")
-    print()
-    print("  THE BOT SENDS NO INPUT AT ALL while you play, and none while it")
-    print("  learns from the recording afterwards. It only drives the game in")
-    print("  the separate training phase"
-          + (" (enabled by --then-train)" if then_train
-             else ", which this run will not enter"))
-    print("  If anything presses keys while you play, it is not this process.")
-    print("=" * 72)
-    print()
-
-    recorder = WatchRecorder(directory=watch_dir, hwnd=hwnd,
-                             frame_size=args.watch_frame_size,
-                             max_steps=args.max_record_steps)
-    if not recorder.open():
-        return 1
-
-    grabber = ScreenGrabber(hwnd)
-    input_recorder = InputRecorder(
-        keymap=keymap,
-        target_hwnd=hwnd,
-        toggle_vk=vk,
-        record_only_when_focused=True,
-        allow_new_keys=True,
-        timeline=recorder.timeline,
-        verbose=True,
-    )
-    if not input_recorder.start():
-        print("[Watch] ERROR: could not install the input hooks:")
-        for err in input_recorder.errors:
-            print(f"        {err}")
-        grabber.close()
-        recorder.close()
-        return 1
-
-    clock = FrameClock(args.watch_fps, report_every=5.0)
-
-    def status() -> Optional[str]:
-        if not input_recorder.recording:
-            return None
-        blocked = _INJECTION_BLOCKED_TOTAL[0]
-        return (f"[Watch] recording: {recorder.step_count} frames "
-                f"({recorder.megabytes:.0f} MB), "
-                f"{input_recorder.key_events} key events, "
-                f"{clock.achieved_hz:.0f} fps, "
-                + (f"new keys: {', '.join(input_recorder.new_keys[-4:])}"
-                   if input_recorder.new_keys else "no new keys")
-                + ("  [INPUT BLOCKED]" if blocked else "  [bot silent]"))
-
-    status_thread = MiniStatusThread(status, interval=3.0)
-    status_thread.start()
-    stop_reason = "start_timeout"
-    try:
-        print(f"[Watch] Waiting for {toggle_key.upper()} to start "
-              f"recording...")
-        waited = 0.0
-        while not input_recorder.recording and waited < CALIBRATE_WAIT_SECONDS:
-            input_recorder.pump()
-            time.sleep(0.01)
-            waited += 0.01
-
-        if not input_recorder.recording:
-            print("[Watch] Timed out waiting for the start key; nothing recorded.")
-        else:
-            stop_reason = "toggle"
-            print("[Watch] RECORDING. Play now. "
-                  f"Press {toggle_key.upper()} again when you are done.")
-            while input_recorder.recording:
-                input_recorder.pump()
-                frame = grabber.grab()
-                recorder.add_frame(frame)
-                if len(recorder.audio_chunks) < 2048:
-                    recorder.audio_chunks.append(np.zeros(0, dtype=np.float32))
-                recorder.flush_events()
-                clock.tick()
-                perf = clock.report()
-                if perf:
-                    print(f"{perf}   recorded {recorder.step_count} frames")
-                if recorder.step_count >= recorder.max_steps:
-                    print(f"[Watch] Reached --max-record-steps "
-                          f"({recorder.max_steps}); stopping the recording.")
-                    stop_reason = "max_steps"
-                    break
-    except KeyboardInterrupt:
-        stop_reason = "ctrl_c"
-        print("\n[Watch] Interrupted; saving the recording so far.")
-    finally:
-        if input_recorder.recording:
-            input_recorder.toggle()
-        status_thread.stop()
-        input_recorder.stop()
-        # The recorder writes events as it goes, so write_meta finalises it.
-        meta_path = recorder.write_meta(keymap, extra={
-            "discovered_keys": list(input_recorder.new_keys),
-            "hook_errors": list(input_recorder.errors),
-            "stop_reason": stop_reason,
-        })
-        recorder.close()
-        grabber.close()
-
-    steps = recorder.step_count
-    if steps == 0:
-        print("[Watch] Nothing was recorded; nothing to learn from.")
-        return 1
-    print()
-    print(f"[Watch] Recorded {steps} frames in "
-          f"{recorder.timeline.duration():.1f}s "
-          f"({recorder.megabytes:.0f} MB) -> {watch_dir}")
-    print(f"[Watch] Metadata: {meta_path}")
-    if steps < SEQ_LEN + 2:
-        print("[Watch] That was too short to learn from; nothing more to do.")
-        return 1
-    if input_recorder.new_keys:
-        print(f"[Watch] New keys added to the keymap: "
-              f"{', '.join(sorted(set(input_recorder.new_keys)))}")
-
-    # Grow the action set with the combinations you actually used, then save.
-    added = _add_recorded_actions(keymap, recorder.timeline)
-    if added:
-        print(f"[Watch] Learned {added} new button combination(s) from your play.")
-    actions, capped = build_action_set(keymap)
-    keymap.set_actions(actions, capped)
-    keymap.samples += steps
-    keymap.path = keymap.path or os.path.abspath(args.keymap)
-    keymap.save()
-    print(f"[Watch] Keymap updated -> {keymap.path} "
-          f"({len(actions)} actions)")
-    print(f"[Watch] Keys: {keymap.describe_keys()}")
-    print(f"[Watch] Mouse turn: {keymap.default_mouse_turn} px per action")
-
-    if args.record_only or args.no_train:
-        print("[Watch] Recording saved. Nothing else will run, so the bot never "
-              "takes the controls.")
-        print(f"[Watch] Learn from it any time with: python bot1.py --watch "
-              f"--then-train --watch-dir \"{watch_dir}\"")
-        return 0
-
-    if args.device == "auto":
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    else:
-        device = torch.device(args.device)
-    if device.type == "cuda" and not torch.cuda.is_available():
-        print("[WARN] CUDA requested but unavailable; falling back to CPU.")
-        device = torch.device("cpu")
-
-    audio_mode = "off" if args.no_audio else args.audio_mode
-    audio_samples = 16000
-
-    # No environment exists in this phase at all: imitation is pure supervised
-    # learning over the recording. There is no capture, no input object and
-    # therefore nothing that could possibly reach the game.
-    control = SignalController(interval_sec=args.checkpoint_interval,
-                               enable_hotkeys=False,
-                               pause_hotkey=args.pause_key,
-                               save_hotkey=args.save_key,
-                               quit_hotkey=args.quit_key)
-
-    initial_model = None
-    initial_optimizer = None
-    initial_step = 0
-    trained = False
-
-    if args.no_bc:
-        print("[Watch] --no-bc: skipping the imitation warm start.")
-    else:
-        dataset, actions = extract_bc_dataset(recorder, keymap, actions,
-                                              frame_size=args.img_size)
-        if dataset is None or len(dataset) < args.seq_len + 2:
-            print("[Watch] Not enough usable frames to imitate.")
-        else:
-            print(f"[Watch] Learning from {len(dataset)} steps of your play. "
-                  f"No window and no input exist in this phase - you keep the "
-                  f"controls.")
-            initial_model = bc_train(
-                dataset,
-                num_actions=len(actions),
-                seq_len=args.seq_len,
-                frame_size=args.img_size,
-                audio_samples=audio_samples,
-                epochs=args.bc_epochs,
-                device=device,
-                control=control,
-            )
-            trained = initial_model is not None
-            keymap.save()
-            del dataset
-            print("[Watch] Imitation done; freeing the recorded frames.")
-
-    if not then_train:
+    # ---- transitions ----
+    def _begin(self):
+        self.active = True
+        self.takeovers += 1
+        self.steps_watched = 0
+        self._next_notice = time.perf_counter() + self.NOTICE_EVERY
+        # Let go of everything *before* the injection switch closes, so no key
+        # is left pressed in the game while you are playing.
+        self.env.suspend_bot()
+        self.watcher.begin_segment()
         print()
-        print("[Watch] Recording and learning are complete. The bot sent no "
-              "input this whole run.")
-        print(f"[Watch] To let it play now: python bot1.py --then-train "
-              f"--watch-dir \"{watch_dir}\"")
-        return 0
+        print("[Human] You have the controls. The bot has let go of every button "
+              "it was holding and is sending nothing at all.")
+        print(f"[Human] It is watching what you press, and takes the controls "
+              f"back {HUMAN_RELEASE_GRACE_SECONDS:.0f}s after your last input.")
 
-    # After imitation, PPO runs forever unless --steps N was given.
-    target_steps = resolve_steps(args.steps,
-                                 default=resolve_steps(WATCH_PPO_STEPS))
+    def _end(self):
+        self.active = False
+        self.env.resume_bot()
+        recorded = self.watcher.end_segment()
+        frames = recorded["frames"]
+        if not frames:
+            print("[Human] Hands off - taking the controls back. Nothing was "
+                  "recorded: the game window was not focused.")
+            return
 
-    # ---- explicit, announced handoff: from here the bot drives the game ----
-    # The input hooks come off first, so by the time you are asked to confirm,
-    # nothing of ours is even listening to your keyboard.
-    input_recorder.stop()
-    print()
-    print("=" * 72)
-    print("  TRAINING PHASE - the bot is about to take the controls")
-    print("=" * 72)
-    print("  Recording and learning are finished. Until you confirm below,")
-    print("  the bot cannot send a single input event.")
-    if not confirm_handoff(toggle_key, args.handoff_seconds):
-        print("[Watch] Cancelled at the handoff. The bot never took the "
-              "controls and sent no input at all this run.")
-        return 0
-    print("=" * 72)
+        segment = build_human_replay(frames, recorded["timestamps"],
+                                     recorded["timeline"], self.env.keymap,
+                                     self.env.actions)
+        if segment is None:
+            print(f"[Human] Hands off - taking the controls back. Recorded "
+                  f"{len(frames)} frame(s), too few to learn anything from.")
+            return
 
-    env = BackgroundGameEnv(
-        hwnd, pid, device,
-        seq_len=args.seq_len,
-        frame_size=args.img_size,
-        capture_delay=args.capture_delay,
-        target_fps=args.target_fps,
-        preview=args.preview,
-        audio_enabled=(audio_mode != "off"),
-        audio_mode=audio_mode,
-        keymap=keymap,
-        action_set=actions,
-    )
-    control = SignalController(interval_sec=args.checkpoint_interval,
-                               enable_hotkeys=not args.no_hotkeys,
-                               pause_hotkey=args.pause_key,
-                               save_hotkey=args.save_key,
-                               quit_hotkey=args.quit_key)
-    # Handed back to run_watch_session, which runs it *outside* the injection
-    # lock - this is the one phase allowed to drive the game.
-    return WatchTrainingPlan(
-        env=env,
-        control=control,
-        total_steps=target_steps,
-        model=initial_model,
-        optimizer=initial_optimizer,
-        step=initial_step,
-        traced=trained,
-    )
+        self.replay.add(segment)
+        notes = []
+        if segment.inexact:
+            notes.append(f"{segment.inexact} rounded to the closest action")
+        if segment.skipped:
+            notes.append(f"{segment.skipped} skipped (buttons this run's action "
+                         f"set cannot express)")
+        if recorded.get("cap_hit"):
+            notes.append(f"stopped at the {self.watcher.max_frames}-frame buffer "
+                         f"limit")
+        print(f"[Human] Hands off - taking the controls back. Recorded "
+              f"{segment.steps} step(s) of your play, "
+              f"{segment.distinct} distinct action(s), "
+              f"{segment.turn_steps} turn step(s)"
+              + (f": {segment.top_labels()}" if segment.labels else "")
+              + (f" [{'; '.join(notes)}]" if notes else ""))
+        print(f"[Human] Imitation buffer now holds {len(self.replay)} frame(s) "
+              f"({self.replay.describe()}); the next PPO updates will copy them.")
+        if self.watcher.new_keys:
+            saved = None
+            try:
+                saved = self.env.keymap.save()
+            except Exception as exc:
+                print(f"[Human] Could not save the keymap: {exc}")
+            print(f"[Human] New buttons learned this session: "
+                  f"{', '.join(sorted(set(self.watcher.new_keys)))}"
+                  + (f" -> {saved}" if saved else ""))
 
 
 # =============================================================================
@@ -3402,7 +3326,7 @@ class AudioCapture:
     process (the earlier pid argument was a no-op and is gone). Per-process
     capture needs WASAPI process loopback, which 'soundcard' does not expose.
     Practical consequence: whatever you are listening to while the bot trains
-    becomes part of its observation. Use --no-audio for unattended runs.
+    becomes part of its observation. Set AUDIO_MODE = "off" for unattended runs.
     """
 
     def __init__(self, sample_rate: int = 16000, buffer_seconds: float = 1.0,
@@ -3515,8 +3439,8 @@ def make_audio_capture(
 
     if mode == "process":
         print(f"[Audio] Per-process capture failed: {cap.last_error}")
-        print("[Audio] Running with SILENCE. Use --audio-mode system instead "
-              "if you want sound.")
+        print("[Audio] Running with SILENCE. Set AUDIO_MODE = \"system\" "
+              "instead if you want sound.")
         return AudioCapture(sample_rate=sample_rate, enabled=False), \
             "silence (process mode requested)"
 
@@ -4136,12 +4060,12 @@ class MultiHeadgMLP(nn.Module):
         # readable message instead of a deep torch traceback.
         if self.frame_size < 40:
             raise ValueError(
-                f"--img-size {self.frame_size} is too small for this encoder; "
-                f"use 40 or larger (84 is the default)"
+                f"IMG_SIZE {self.frame_size} is too small for this encoder; "
+                f"use 40 or larger (160 is the default)"
             )
 
         # Visual encoder (small CNN). The adaptive pool keeps the flattened
-        # size constant, so --img-size can change without breaking the heads.
+        # size constant, so IMG_SIZE can change without breaking the heads.
         self.visual_cnn = nn.Sequential(
             nn.Conv2d(3, 32, kernel_size=8, stride=4), nn.ReLU(),
             nn.Conv2d(32, 64, kernel_size=4, stride=2), nn.ReLU(),
@@ -4206,15 +4130,16 @@ class InjectionLock:
     """
     While held, no SendInput can leave this process.
 
-    --watch and --calibrate wrap their entire duration in one of these, so the
-    game is guaranteed to be yours: not just the actions the bot chooses, but
-    any stray call anywhere in the program. It reports how many attempts were
-    refused when it is released, which makes a hidden code path loud instead of
-    silent.
+    --calibrate wraps its entire duration in one of these, so the game is
+    guaranteed to be yours while you demonstrate: not just the actions the bot
+    chooses, but any stray call anywhere in the program. It reports how many
+    attempts were refused when it is released, which makes a hidden code path
+    loud instead of silent.
 
-    Confirming the handoff (below) is the one deliberate crack in the door: the
-    user has to answer a prompt before the lock opens, because from then on the
-    bot really is driving the game.
+    Training does not use this lock. There the bot is *supposed* to drive, and
+    a human takeover is handled by BackgroundInput.suspended instead - a soft
+    switch the training loop flips for as long as your hands are on the
+    controls, which would otherwise be reported as a bug every three seconds.
     """
 
     def __init__(self, reason: str = "this mode"):
@@ -4240,66 +4165,6 @@ class InjectionLock:
     @staticmethod
     def note_block():
         _INJECTION_BLOCKED_TOTAL[0] += 1
-
-
-def confirm_handoff(toggle_key: str = "f8",
-                    seconds: float = TRAIN_HANDOFF_SECONDS,
-                    answer_seconds: float = 30.0) -> bool:
-    """
-    Ask before the injection lock opens.
-
-    The lock guarantees the game stays yours for as long as the bot is watching;
-    this is the one intentional exit, so it asks rather than assumes. It counts
-    the wait down, prints the prompt, and then reads an answer on a background
-    thread with a timeout - so the question is always asked, on every terminal,
-    and silence for `answer_seconds` means "no" rather than "yes".
-
-    Returns True only when the handoff is confirmed.
-    """
-    seconds = max(0.0, float(seconds))
-    print()
-    print("  The next phase lets the bot DRIVE THE GAME. Recording and learning")
-    print("  are finished, and it has sent no input so far.")
-    print("  Let go of the keyboard and mouse now.")
-    if seconds > 0:
-        remaining = seconds
-        while remaining > 0:
-            print(f"    ...{remaining:2.0f}s", end="\r", flush=True)
-            time.sleep(min(0.25, remaining))
-            remaining -= 0.25
-        print("                ", end="\r", flush=True)
-
-    answer: "queue.Queue[str]" = queue.Queue()
-
-    def read_answer():
-        try:
-            answer.put(sys.stdin.readline())
-        except Exception:
-            answer.put("")
-
-    threading.Thread(target=read_answer, name="HandoffPrompt",
-                     daemon=True).start()
-    print(f"  Start training? [Enter/{toggle_key.upper()} = yes, "
-          f"n = no] ", end="", flush=True)
-    try:
-        line = answer.get(timeout=max(1.0, float(answer_seconds)))
-    except queue.Empty:
-        print()
-        print("  No answer - treating that as no. The bot will not touch the "
-              "game.")
-        return False
-    except KeyboardInterrupt:
-        print()
-        return False
-    if _is_refusal(line):
-        print("  Cancelled.")
-        return False
-    print("  Confirmed - the bot is taking the controls.")
-    return True
-
-
-def _is_refusal(line: str) -> bool:
-    return str(line or "").strip().lower() in ("n", "no", "q", "quit", "cancel")
 
 
 # Counts every refused injection process-wide, so the lock can report totals.
@@ -4348,6 +4213,13 @@ class BackgroundInput:
         self.focus_warned = False
         self.last_send_count = None
         self.last_send_error = None
+        # Soft switch for human takeovers: while True this object injects
+        # nothing at all, and does so silently (it is expected, not a bug).
+        # BackgroundGameEnv.suspend_bot()/resume_bot() own it.
+        self.suspended = False
+        # Keys/buttons this object is pressing right now as part of a tap or a
+        # click (not a hold), so nothing reads them as somebody else's input.
+        self.transient_vks: set = set()
 
     # ---- focus ----
     def _ensure_focus(self) -> bool:
@@ -4427,10 +4299,10 @@ class BackgroundInput:
         """
         Refuse to inject anything while input is globally disabled.
 
-        This is the last line of defence. run_watch_session and run_calibration
-        disable injection for their whole duration, so even a code path that
-        nobody remembered about cannot press a key while you are playing or
-        teaching. Every attempt is counted and reported.
+        This is the last line of defence. run_calibration disables injection for
+        its whole duration, so even a code path that nobody remembered about
+        cannot press a key while you are teaching. Every attempt is counted and
+        reported.
         """
         if INPUT_INJECTION_ENABLED:
             return False
@@ -4446,6 +4318,10 @@ class BackgroundInput:
         return True
 
     def _send_input_key(self, vk: int, key_up: bool):
+        if self.suspended:
+            # The controls are yours; this is deliberate and silent.
+            self.last_send_count = 0
+            return
         if self._blocked_injection(f"key 0x{int(vk):02X} "
                                    f"{'up' if key_up else 'down'}"):
             self.last_send_count = 0
@@ -4465,6 +4341,9 @@ class BackgroundInput:
             self.last_send_error = ctypes.get_last_error()
 
     def _send_input_mouse(self, dx: int, dy: int, flags: int):
+        if self.suspended:
+            self.last_send_count = 0
+            return
         if self._blocked_injection(f"mouse dx={dx} dy={dy} flags=0x{flags:04X}"):
             self.last_send_count = 0
             return
@@ -4513,9 +4392,17 @@ class BackgroundInput:
         vk = self.vk_for(key)
         if not vk:
             return
-        self._send_input_key(vk, False)
-        time.sleep(duration)
-        self._send_input_key(vk, True)
+        # A tap is down-then-up with a sleep in between, so the key reads as
+        # "physically down" while the bot does not have it in a hold set. Note
+        # it in transient_vks so the human-takeover watcher's key-state probe
+        # never mistakes the bot's own tap for your hands.
+        self.transient_vks.add(int(vk))
+        try:
+            self._send_input_key(vk, False)
+            time.sleep(duration)
+            self._send_input_key(vk, True)
+        finally:
+            self.transient_vks.discard(int(vk))
 
     def mouse_move(self, dx: int, dy: int):
         """
@@ -4544,9 +4431,16 @@ class BackgroundInput:
                  'middle': (0x0020, 0x0040)}.get(button)
         if not flags:
             return
-        self._send_input_mouse(0, 0, flags[0])
-        time.sleep(duration)
-        self._send_input_mouse(0, 0, flags[1])
+        vk = {"left": 0x01, "right": 0x02, "middle": 0x04}.get(button)
+        if vk:
+            self.transient_vks.add(vk)
+        try:
+            self._send_input_mouse(0, 0, flags[0])
+            time.sleep(duration)
+            self._send_input_mouse(0, 0, flags[1])
+        finally:
+            if vk:
+                self.transient_vks.discard(vk)
 
 
 # =============================================================================
@@ -4694,6 +4588,17 @@ class IntrinsicReward:
         # An episode boundary does not restart the game, so the novelty memory
         # deliberately survives it; only per-step state is cleared.
         self.prev_obs = None
+        self.idle_streak = 0
+
+    def note_human(self, obs_np: np.ndarray):
+        """
+        Note a step the bot did not take, because you had the controls.
+
+        The frame is adopted as the new reference, so the first reward after the
+        bot takes over does not charge you a huge unexplained disruption, and
+        the idle streak is cleared rather than left to ramp up while you play.
+        """
+        self.prev_obs = obs_np.copy()
         self.idle_streak = 0
 
     # ---- checkpointing -----------------------------------------------------
@@ -4905,10 +4810,9 @@ class BackgroundGameEnv(gym.Env):
         self.clock = FrameClock(self.target_fps, self.capture_delay)
         self.last_capture_ms = 0.0
         # dry_run keeps everything else identical (observations, reward, action
-        # ids) while making the actual injection a no-op. It exists so phases
-        # that must not touch the player's controls - imitation learning from a
-        # --watch recording, for instance - can use a real environment without
-        # any chance of pressing a key.
+        # ids) while making the actual injection a no-op. Nothing in the current
+        # design needs it - human takeovers use suspend_bot() instead - but it
+        # stays as a way to exercise the environment without a game.
         self.dry_run = bool(dry_run)
         self.input = BackgroundInput(hwnd)
         self.input.set_keymap(self.keymap)
@@ -4920,6 +4824,9 @@ class BackgroundGameEnv(gym.Env):
         self._held: set = set()
         self._action_override: Optional[set] = None
         self._tracked_hold: set = set()
+        # True while a human has the controls: nothing is injected, and the
+        # observation advances without any action being taken.
+        self._suspended = False
 
         self.audio_capture, self.audio_description = make_audio_capture(
             pid=pid,
@@ -5092,6 +4999,11 @@ class BackgroundGameEnv(gym.Env):
         In dry_run the bookkeeping still happens, but nothing is injected.
         """
         target = {int(vk) for vk in buttons if vk}
+        if self._suspended:
+            # The controls are yours. suspend_bot() already lifted everything,
+            # and nothing new may go down until resume_bot().
+            self._held = set()
+            return
         if not self.dry_run:
             if target != self._held:
                 # Input only lands in the focused window, so make sure of it
@@ -5106,6 +5018,60 @@ class BackgroundGameEnv(gym.Env):
     def release_all(self):
         """Let go of everything - used on reset, pause and shutdown."""
         self.set_held(set())
+
+    # ---- human takeover ----
+    @property
+    def held_vks(self) -> set:
+        """The buttons the bot is holding right now, so the watcher can tell
+        the bot's own held keys apart from yours. Taps and clicks in flight
+        count too - the key is physically down even though it is not a hold."""
+        return set(self._held) | set(self.input.transient_vks)
+
+    @property
+    def suspended(self) -> bool:
+        return self._suspended
+
+    def suspend_bot(self):
+        """
+        Hand the controls over: let go of everything, then inject nothing.
+
+        The release happens first and on purpose - while injection is still
+        allowed - so the game is not left believing a key is held down when you
+        start playing.
+        """
+        if self._suspended:
+            return
+        self.release_all()
+        self.input.suspended = True
+        self._suspended = True
+
+    def resume_bot(self):
+        """Take the controls back. Nothing is pressed until the next action."""
+        if not self._suspended:
+            return
+        self.input.suspended = False
+        self._suspended = False
+
+    def observe_human_step(self) -> np.ndarray:
+        """
+        Advance the observation while you are playing.
+
+        The bot sends nothing, but it keeps the frame and audio buffers current
+        (and paces itself at TARGET_FPS) so the policy is not looking at a stale
+        frame the moment it takes the controls back. The intrinsic reward is
+        told too, so the world changing under it is not charged to the bot as
+        disruption or as an idle streak.
+        """
+        self.release_all()
+        self.clock.tick()
+        frame = self._get_visual_frame()
+        self.audio_buffer.append(self._get_audio_chunk())
+        self.visual_buffer.append(frame)
+        self._show_preview(frame)
+        self._check_frozen(frame)
+        self.intrinsic.note_human(frame)
+        self.step_count += 1
+        return frame
 
     def _apply_action(self, action: int):
         """
@@ -5287,6 +5253,7 @@ def train_ppo(
     initial_step: int = 0,
     control: Optional[SignalController] = None,
     entropy_coef: float = ENTROPY_COEF,
+    human: Optional[HumanWatcher] = None,
 ) -> MultiHeadgMLP:
     """
     PPO training loop with three escape hatches:
@@ -5302,8 +5269,12 @@ def train_ppo(
 
     Every checkpoint contains the model, optimizer, reward nets, step counter,
     rollout buffers and RNG state, so 'checkpoints/last.pt' is a resumable file.
-    Pass an existing `control` object to reuse one that is already running
-    (watch mode does this, so the hotkeys are only registered once).
+
+    When a `human` watcher is passed, the loop also gives the game back to you
+    the moment you touch the keyboard or mouse: it collects no transitions, it
+    sends no input, it records what you did, and HUMAN_RELEASE_GRACE_SECONDS
+    after your last input it resumes and takes one imitation step towards your
+    behaviour after each of the next PPO updates.
 
     The entropy bonus keeps the policy from collapsing onto a single action.
     With ADAPTIVE_ENTROPY it is raised automatically whenever the policy stops
@@ -5367,6 +5338,10 @@ def train_ppo(
                                    enable_hotkeys=enable_hotkeys)
         control.start()
 
+    # The handover to you and back, plus the buffer of your play it fills.
+    takeover = HumanTakeover(env, human) if human is not None else None
+    imitation_steps = 0
+
     obs, _ = env.reset()
     episode_reward = 0.0
     step = 0
@@ -5423,8 +5398,8 @@ def train_ppo(
     print(f"  Auto-checkpoint every {checkpoint_interval / 60:.1f} min, "
           f"keeping the latest {keep_checkpoints} in "
           f"'{checkpoint_manager.directory}'")
-    print(f"  Resume later with: python bot1.py --resume auto "
-          f"--checkpoint-dir \"{checkpoint_manager.directory}\"")
+    print(f"  Resume later with: python bot1.py  (it picks up "
+          f"'{os.path.basename(checkpoint_manager.last_path)}' automatically)")
     print("-" * 72)
     print()
     print("[Training] Starting...")
@@ -5440,7 +5415,14 @@ def train_ppo(
                 if control.claim_pause_notice():
                     print("[Control] PAUSED. The bot sends no input while paused. "
                           "Press the pause key again to resume.")
-                control.wait_while_paused()
+                # Stay in the pause, but keep servicing a takeover: pressing F8
+                # and then playing should still record what you did.
+                while control.paused and not control.stop_requested:
+                    for message in control.service():
+                        print(f"[Control] {message}")
+                    if takeover is not None:
+                        takeover.service()
+                    time.sleep(0.05)
 
             due = control.checkpoint_due()
             if due:
@@ -5449,7 +5431,29 @@ def train_ppo(
             if control.stop_requested:
                 break
 
+            # ---- are you taking the controls back? ----
+            if takeover is not None:
+                state = takeover.service()
+                if state == "human":
+                    continue
+                if state == "resumed":
+                    # The buffers kept up with your play, so make sure the
+                    # policy acts on the current view rather than the one from
+                    # before it handed the game over.
+                    obs = env._get_obs()
+
             for _ in range(batch_size):
+                if takeover is not None:
+                    state = takeover.service()
+                    if state == "human":
+                        # Drop the partial batch: the world moved on without us,
+                        # so the queued rollouts are no longer a chain.
+                        for key in rollout:
+                            rollout[key].clear()
+                        break
+                    if state == "resumed":
+                        obs = env._get_obs()
+
                 vis = torch.tensor(obs["visual"], dtype=torch.float32).unsqueeze(0).to(device)
                 aud = torch.tensor(obs["audio"], dtype=torch.float32).unsqueeze(0).to(device)
 
@@ -5579,6 +5583,23 @@ def train_ppo(
             for k in rollout:
                 rollout[k].clear()
 
+            # ---- learn from anything you demonstrated while driving ----
+            # One supervised step towards "do what the human just did", on a
+            # small class-weighted minibatch. Separate from the PPO epochs and
+            # scaled by HUMAN_IMITATION_WEIGHT, so it nudges the policy towards
+            # your play without taking the update over.
+            if takeover is not None and takeover.replay.ready():
+                try:
+                    if takeover.replay.imitation_step(model, optimizer, device):
+                        imitation_steps += 1
+                        if imitation_steps % 50 == 1:
+                            print(f"[Human] Imitation step {imitation_steps}: "
+                                  f"loss={takeover.replay.last_loss:.4f} "
+                                  f"match={100.0 * takeover.replay.last_match:.0f}% "
+                                  f"over {len(takeover.replay)} recorded frame(s).")
+                except Exception as exc:
+                    print(f"[Human] Imitation step skipped: {exc}")
+
             if step >= next_status:
                 next_status = step + status_every
                 report_training_status(
@@ -5628,6 +5649,10 @@ def train_ppo(
     for entry in checkpoint_manager.list_kept():
         print(f"       step {entry['step']:>9}  ({entry['reason']})  {entry['path']}")
     print(f"[Done] Rolling resume file: {checkpoint_manager.last_path}")
+    if takeover is not None and takeover.takeovers:
+        print(f"[Done] You took the controls {takeover.takeovers} time(s); the "
+              f"imitation buffer ended with {len(takeover.replay)} frame(s) and "
+              f"was used in {imitation_steps} update(s).")
 
     bad = model_has_nonfinite(model)
     if bad:
@@ -5688,8 +5713,8 @@ def load_checkpoint(path: str, device: torch.device,
         saved_size = int(cfg.get("frame_size") or MODEL_CONFIG["frame_size"])
         if saved_size != expect_frame_size:
             print(f"[Resume] '{os.path.basename(path)}' used {saved_size}px "
-                  f"frames but --img-size is {expect_frame_size}; starting "
-                  f"fresh (re-run with --img-size {saved_size} to resume it).")
+                  f"frames but IMG_SIZE is {expect_frame_size}; starting fresh "
+                  f"(set IMG_SIZE = {saved_size} to resume it).")
             return None
 
     try:
@@ -5733,7 +5758,7 @@ def resolve_steps(value, default: int = FOREVER_STEPS) -> int:
         try:
             value = int(float(text))
         except (TypeError, ValueError):
-            print(f"[Steps] Unrecognised --steps value {value!r}; training "
+            print(f"[Steps] Unrecognised TOTAL_STEPS value {value!r}; training "
                   f"forever instead.")
             return FOREVER_STEPS
     try:
@@ -5777,182 +5802,151 @@ def lower_process_priority(level: str) -> None:
         print(f"[Priority] Could not change priority: {exc}")
 
 
+def hotkey_vks(*specs: str) -> set:
+    """Virtual keys the global hotkeys use, so they are never read as yours."""
+    if not specs:
+        specs = (HOTKEY_PAUSE, HOTKEY_SAVE, HOTKEY_QUIT)
+    vks = set()
+    for spec in specs:
+        if not spec:
+            continue
+        try:
+            _modifiers, vk = parse_hotkey(spec)
+        except ValueError:
+            continue
+        vks.add(int(vk))
+    return vks
+
+
 def build_parser() -> argparse.ArgumentParser:
     """
-    Build the command line.
+    The command line, which is now exactly one option.
 
-    Every option defaults to the SECTION 0 constant of the same purpose, so
-    running `python bot1.py` with no arguments uses your configured settings.
-    The flags exist only to override them for a single run.
+    Everything else the program can be told to do is a constant in SECTION 0.
+    The flags that used to exist only ever overrode those constants for a single
+    run, so they were removed: the constants are the single source of truth.
     """
     parser = argparse.ArgumentParser(
-        description="Train a background-window RL agent with pausable hotkeys "
-                    "and rolling checkpoints. Run with no arguments to use the "
-                    "settings in SECTION 0 of the script.",
-        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+        prog="bot1.py",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        description=(
+            "Train a gMLP agent to play a windowed game from game-agnostic\n"
+            "intrinsic rewards, and let it watch you whenever you take the\n"
+            "controls back.\n\n"
+            "  python bot1.py              train (and hand the controls to you\n"
+            "                              whenever you touch the keyboard or\n"
+            "                              mouse, then take them back 3s later)\n"
+            "  python bot1.py --calibrate  teach it which keys it may press\n\n"
+            "Every other setting is a constant in SECTION 0 of the script."),
     )
-    parser.add_argument("--steps", default=None,
-                        help=f"how many environment steps to train for; "
-                             f"'{FOREVER}' (the default) never stops. Ctrl+C or "
-                             f"F10 stops it cleanly, and the next launch resumes "
-                             f"from the newest checkpoint")
-    parser.add_argument("--forever", action="store_true",
-                        help="train without a step limit (this is the default; "
-                             "use --steps N for a finite run)")
-    parser.add_argument("--max-steps", dest="steps", default=None,
-                        help="alias for --steps N, for a finite run")
-    parser.add_argument("--batch-size", type=int, default=BATCH_SIZE,
-                        help="rollout length between PPO updates")
-    parser.add_argument("--img-size", type=int, default=IMG_SIZE,
-                        help="square frame size fed to the model")
-    parser.add_argument("--seq-len", type=int, default=SEQ_LEN,
-                        help="number of frames per observation")
-    parser.add_argument("--capture-delay", type=float, default=CAPTURE_DELAY,
-                        help="extra seconds slept between steps, on top of the "
-                             "target rate (raise it if the desktop feels sluggish)")
-    parser.add_argument("--target-fps", type=float, default=TARGET_FPS,
-                        help="how many times per second the bot may grab a frame "
-                             "and act; this is its reaction rate")
-    parser.add_argument("--device", default=DEVICE, choices=["auto", "cuda", "cpu"],
-                        help="compute device for the model")
-    parser.add_argument("--window", type=int, default=TARGET_WINDOW_HWND,
-                        help="hwnd of the target window, skipping the picker")
-    parser.add_argument("--select", action="store_true",
-                        help="always show the interactive window list first")
-    parser.add_argument("--pick", action="store_true",
-                        help="choose the target window from the numbered list "
-                             "before starting (same as --select)")
-    parser.add_argument("--list-windows", action="store_true",
-                        help="print every visible window with its hwnd and exit")
-    parser.add_argument("--calibrate", action="store_true",
-                        help="learn which keys and mouse buttons the bot may use: "
-                             "pick the window, press the toggle key, play, press "
-                             "it again, and a keymap JSON is written")
-    parser.add_argument("--calibrate-key", default="f8",
-                        help="the start/stop key for --calibrate")
-    parser.add_argument("--calibrate-min-hold", type=float,
-                        default=CALIBRATE_MIN_HOLD,
-                        help="ignore presses shorter than this many seconds "
-                             "during --calibrate (0 keeps every press)")
-    parser.add_argument("--keymap", default=KEYMAP_PATH,
-                        help="path to the keymap JSON written by --calibrate and "
-                             "read by every other mode")
-    parser.add_argument("--fresh-keymap", action="store_true",
-                        help="with --calibrate, ignore an existing keymap and "
-                             "start from the built-in defaults")
-    parser.add_argument("--show-keymap", action="store_true",
-                        help="print the loaded keymap and its actions, then exit")
-    parser.add_argument("--watch", action="store_true",
-                        help="record yourself playing and learn from it; the "
-                             "bot sends no input while recording or learning")
-    parser.add_argument("--watch-key", default=None,
-                        help="the start/stop key for --watch "
-                             "(defaults to --calibrate-key)")
-    parser.add_argument("--then-train", action="store_true",
-                        help="with --watch, let the bot take the controls and "
-                             "run PPO afterwards (there is a countdown first)")
-    parser.add_argument("--no-train", action="store_true",
-                        help="alias for --record-only: never let the bot drive")
-    parser.add_argument("--handoff-seconds", type=float,
-                        default=TRAIN_HANDOFF_SECONDS,
-                        help="seconds to wait, letting you let go of the "
-                             "controls, before --then-train starts driving")
-    parser.add_argument("--watch-dir", default=WATCH_DIR,
-                        help="folder for recorded play (frames + input timeline)")
-    parser.add_argument("--watch-fps", type=float, default=WATCH_TARGET_FPS,
-                        help="how often your play is sampled while watching")
-    parser.add_argument("--watch-frame-size", type=int, default=WATCH_FRAME_SIZE,
-                        help="pixels per stored frame while watching")
-    parser.add_argument("--max-record-steps", type=int, default=WATCH_MAX_STEPS,
-                        help="stop recording after this many steps")
-    parser.add_argument("--bc-epochs", type=int, default=BC_EPOCHS,
-                        help="behavioral-cloning passes over your recording")
-    parser.add_argument("--no-bc", action="store_true",
-                        help="with --watch, record and save the dataset but skip "
-                             "the behavioral-cloning warm start")
-    parser.add_argument("--record-only", action="store_true",
-                        help="with --watch, save the recording and exit; no "
-                             "imitation and no PPO")
-    parser.add_argument("--print-actions", action="store_true",
-                        help="print the action list the bot will choose from, "
-                             "then exit")
-    parser.add_argument("--preview", action="store_true", default=SHOW_PREVIEW,
-                        help="show a small live preview of what the model sees")
-    parser.add_argument("--checkpoint-interval", type=float,
-                        default=CHECKPOINT_INTERVAL_SEC,
-                        help="seconds between automatic checkpoints")
-    parser.add_argument("--keep-checkpoints", type=int, default=CHECKPOINT_KEEP,
-                        help="how many timestamped checkpoints to keep")
-    parser.add_argument("--checkpoint-dir", default=CHECKPOINT_DIR,
-                        help="folder for checkpoints")
-    parser.add_argument("--pause-key", default=HOTKEY_PAUSE,
-                        help="global hotkey to pause/resume")
-    parser.add_argument("--save-key", default=HOTKEY_SAVE,
-                        help="global hotkey to save a checkpoint")
-    parser.add_argument("--quit-key", default=HOTKEY_QUIT,
-                        help="global hotkey to quit cleanly")
-    parser.add_argument("--no-hotkeys", action="store_true",
-                        help="disable global hotkeys (Ctrl+C still saves)")
-    parser.add_argument("--priority", default=PRIORITY,
-                        choices=["below_normal", "normal", "high"],
-                        help="process priority while training")
-    parser.add_argument("--resume", nargs="?", const="auto", default=None,
-                        help="resume from a checkpoint ('auto' = the newest one)")
-    parser.add_argument("--no-resume", action="store_true",
-                        help="ignore any existing checkpoint and start fresh")
-    parser.add_argument("--audio-mode", default=AUDIO_MODE,
-                        choices=list(AUDIO_MODES),
-                        help="process: only the target window's audio; system: "
-                             "whole output device; exclude-self: everything "
-                             "except this script; auto: process then fall back; "
-                             "off: silence")
-    parser.add_argument("--no-audio", action="store_true",
-                        help="shorthand for --audio-mode off")
-    parser.add_argument("--no-tests", action="store_true",
-                        help="skip the capture/audio/key self-tests")
-    parser.add_argument("--auto-window", action="store_true",
-                        help="auto-target the largest likely game window without "
-                             "prompting, even if PREFER_GAME_WINDOW is False")
-    parser.add_argument("--no-auto-window", action="store_true",
-                        help="always show the window picker instead of "
-                             "auto-targeting a likely game window")
-    parser.add_argument("--diag-capture", nargs="?", type=int, const=5,
-                        default=None, metavar="SECONDS",
-                        help="grab the target window for N seconds, report "
-                             "whether the pixels actually change, then exit")
-    parser.add_argument("--diag-input", action="store_true",
-                        help="tap a key and report whether the game reacted "
-                             "(checks that input really lands)")
-    parser.add_argument("--diag-input-key", default="E",
-                        help="the key --diag-input taps; pick one that causes a "
-                             "big, obvious frame change in your game")
-    parser.add_argument("--diag-watch-safety", action="store_true",
-                        help="check that watching/calibration cannot inject "
-                             "input, then exit")
-    parser.add_argument("--release-keys", action="store_true",
-                        help="lift every key/button the bot could have pressed "
-                             "(clears a stuck key left by a killed run), "
-                             "then exit")
+    parser.add_argument(
+        "--calibrate", action="store_true",
+        help="learn which keys and mouse buttons the bot may use: pick the "
+             "window, press the toggle key (F8), play, press it again, and a "
+             "keymap JSON is written")
     return parser
 
 
-def resolve_step_args(args: argparse.Namespace) -> argparse.Namespace:
+def build_config(argv: Optional[List[str]] = None) -> argparse.Namespace:
     """
-    Settle the --steps / --forever / --max-steps trio.
+    Settle every run setting into one namespace.
 
-    Training is unlimited by default: the user has to ask for a finite run. This
-    normalises all three spellings into one absolute step target so the rest of
-    the program never has to think about it.
+    Only --calibrate comes from the command line; all of these values are the
+    SECTION 0 constants, gathered here so the rest of the program keeps reading
+    a single object.
     """
-    if args.steps is None or args.forever:
-        target = resolve_steps(TOTAL_STEPS)
-    else:
-        target = resolve_steps(args.steps)
-    if target < FOREVER_STEPS:
-        args.steps = target
-    else:
-        args.steps = FOREVER
-    return args
+    parsed = build_parser().parse_args(argv)
+    return argparse.Namespace(
+        calibrate=bool(parsed.calibrate),
+        # ---- keymap ----
+        keymap=KEYMAP_PATH,
+        calibrate_key=CALIBRATE_KEY,
+        calibrate_min_hold=CALIBRATE_MIN_HOLD,
+        fresh_keymap=CALIBRATE_FRESH_KEYMAP,
+        # ---- window selection ----
+        window=TARGET_WINDOW_HWND,
+        select=False,
+        pick=False,
+        auto_window=False,
+        no_auto_window=not PREFER_GAME_WINDOW,
+        # ---- training / machine load ----
+        steps=TOTAL_STEPS,
+        batch_size=BATCH_SIZE,
+        img_size=IMG_SIZE,
+        seq_len=SEQ_LEN,
+        capture_delay=CAPTURE_DELAY,
+        target_fps=TARGET_FPS,
+        device=DEVICE,
+        preview=SHOW_PREVIEW,
+        priority=PRIORITY,
+        no_tests=not RUN_STARTUP_TESTS,
+        # ---- checkpoints and global control ----
+        checkpoint_interval=CHECKPOINT_INTERVAL_SEC,
+        keep_checkpoints=CHECKPOINT_KEEP,
+        checkpoint_dir=CHECKPOINT_DIR,
+        pause_key=HOTKEY_PAUSE,
+        save_key=HOTKEY_SAVE,
+        quit_key=HOTKEY_QUIT,
+        no_hotkeys=not ENABLE_HOTKEYS,
+        resume="auto" if RESUME_ON_START else None,
+        no_resume=not RESUME_ON_START,
+        # ---- audio ----
+        audio_mode=AUDIO_MODE,
+        no_audio=(str(AUDIO_MODE).lower() == "off"),
+        # ---- one-shot diagnostics (set DIAGNOSTIC in SECTION 0) ----
+        diagnostic=str(DIAGNOSTIC or "").strip().lower(),
+        diagnostic_seconds=DIAGNOSTIC_SECONDS,
+        diagnostic_key=DIAG_INPUT_KEY,
+    )
+
+
+def run_diagnostic(args) -> int:
+    """
+    The old diagnostic flags, now driven by the DIAGNOSTIC constant.
+
+    "windows" and "actions" need no window; the rest pick one first, exactly
+    like a training run does.
+    """
+    kind = args.diagnostic
+    if kind in ("windows", "list-windows", "list_windows"):
+        windows = enumerate_windows(min_area=1)
+        print(format_window_table(windows))
+        print(f"\n{len(windows)} windows. Put the one you want in "
+              f"TARGET_WINDOW_HWND in SECTION 0 to skip the picker.")
+        return 0
+    if kind in ("actions", "print-actions", "keymap", "show-keymap"):
+        keymap, actions = build_action_set_for_args(args)
+        print()
+        print(f"Keymap   : {keymap.path or '(built-in defaults)'}")
+        print(f"Origin   : {keymap.origin}")
+        print(f"Keys     : {keymap.describe_keys()}")
+        print(f"Mouse    : turn {keymap.default_mouse_turn} px per action")
+        print(f"Actions  : {len(actions)}"
+              + (" (capped at MAX_ACTIONS)" if keymap.actions_capped else ""))
+        print("-" * 72)
+        for action in actions:
+            print(f"{action['id']:>4}  {action.get('label', '?'):<34} "
+                  f"{describe_action(action, keymap)}")
+        print("-" * 72)
+        return 0
+
+    known = ("capture", "input", "safety", "release")
+    if kind not in known:
+        print(f"[DIAGNOSTIC] Unrecognised value {kind!r}. Use one of "
+              f"{', '.join(known + ('windows', 'actions'))}, or \"\" for none.")
+        return 2
+
+    target = choose_window(args, force_picker=False)
+    if target is None:
+        print("[Cancelled] No target window selected.")
+        return 1
+    if kind == "capture":
+        return diag_capture(target["hwnd"], float(args.diagnostic_seconds))
+    if kind == "input":
+        return diag_input(target["hwnd"], args.diagnostic_key)
+    if kind == "safety":
+        return diag_watch_safety(target["hwnd"])
+    return release_stuck_keys(target["hwnd"])
 
 
 def diag_input(hwnd: int, key: str = "E") -> int:
@@ -5962,7 +5956,8 @@ def diag_input(hwnd: int, key: str = "E") -> int:
     Taps `key` (the inventory key in most survival games), watches for the big
     frame change that opening a menu causes, then taps Escape to close it again.
     This is the quickest way to confirm the whole input path works on a new
-    machine, and --diag-input-key lets you choose a key your game reacts to.
+    machine; set DIAG_INPUT_KEY to a key your game reacts to. Reachable with
+    DIAGNOSTIC = "input".
     """
     print(f"[input-diag] window: {win32gui.GetWindowText(hwnd)!r}")
     print(f"[input-diag] hwnd={hwnd} foreground="
@@ -6013,10 +6008,10 @@ def diag_input(hwnd: int, key: str = "E") -> int:
     print("[input-diag] RESULT: NO REACTION TO THE KEY. Check, in order:")
     print("[input-diag]   1. The game window must be focused and in an active")
     print("[input-diag]      state (not a menu or a loading screen).")
-    print("[input-diag]   2. Run --diag-capture: if the image is frozen, a real")
-    print("[input-diag]      change could not show up.")
+    print("[input-diag]   2. Set DIAGNOSTIC = \"capture\": if the image is")
+    print("[input-diag]      frozen, a real change could not show up.")
     print(f"[input-diag]   3. {key.upper()} may not do anything visible in this")
-    print("[input-diag]      game - try --diag-input-key <KEY> with one that does.")
+    print("[input-diag]      game - set DIAG_INPUT_KEY to one that does.")
     return 1
 
 
@@ -6069,13 +6064,14 @@ def release_stuck_keys(hwnd: int) -> int:
 
 def diag_watch_safety(hwnd: int) -> int:
     """
-    Prove that watching cannot touch the game.
+    Prove that calibration cannot touch the game.
 
     Run this while you are in a game (or on the desktop) to check that this
     build refuses to inject input when it is supposed to. It holds the same
-    injection lock --watch holds, deliberately tries to press keys, clicks and
-    mouse movements, and reports that every one of them was refused. If this
-    passes, nothing in --watch can reach your controls.
+    injection lock --calibrate holds, deliberately tries to press keys, clicks
+    and mouse movements, and reports that every one of them was refused. If
+    this passes, nothing you do during calibration can be fighting the bot.
+    Reachable with DIAGNOSTIC = "safety".
     """
     print("[watch-safety] Checking that input injection is refused...")
     attempts = [
@@ -6107,8 +6103,7 @@ def diag_watch_safety(hwnd: int) -> int:
     from_switch = INPUT_INJECTION_ENABLED
     print(f"[watch-safety] injection re-enabled after the lock: {from_switch}")
     if inside > 0 and from_switch:
-        print("[watch-safety] RESULT: SAFE - --watch cannot send input. Any keys "
-              "you see pressed while playing come from something else.")
+        print("[watch-safety] RESULT: SAFE - calibration cannot send input.")
         return 0
     print("[watch-safety] RESULT: UNSAFE - input got through. Please report this "
           "with the numbers above.")
@@ -6186,14 +6181,14 @@ def choose_window(args, force_picker: bool = False) -> Optional[dict]:
     """
     Resolve the target window. No game is special-cased; any window works.
 
-    Order: an explicit --window hwnd, then (when PREFER_GAME_WINDOW) the largest
-    window that merely *looks* like a game, otherwise the interactive picker.
-    The heuristic only decides what to try first - if your game is not
+    Order: the pinned TARGET_WINDOW_HWND, then (when PREFER_GAME_WINDOW) the
+    largest window that merely *looks* like a game, otherwise the interactive
+    picker. The heuristic only decides what to try first - if your game is not
     recognised, pick it from the list and everything works the same.
 
-    --select / --pick (or force_picker, used by --calibrate and --watch) always
-    shows the numbered window list first, so you can point calibration and
-    recording at exactly the window you want instead of whatever was guessed.
+    force_picker (used by --calibrate) always shows the numbered window list
+    first, so calibration can be pointed at exactly the window you play in
+    instead of whatever was guessed.
     """
     want_picker = force_picker or getattr(args, "select", False) \
         or getattr(args, "pick", False) \
@@ -6204,7 +6199,7 @@ def choose_window(args, force_picker: bool = False) -> Optional[dict]:
         if not win32gui.IsWindow(hwnd):
             print(f"[ERROR] hwnd {hwnd} is not a valid window.")
             return None
-        print(f"[picker] Using --window {hwnd} "
+        print(f"[picker] Using TARGET_WINDOW_HWND {hwnd} "
               f"({win32gui.GetWindowText(hwnd)!r}).")
         return _window_info(hwnd)
 
@@ -6212,8 +6207,8 @@ def choose_window(args, force_picker: bool = False) -> Optional[dict]:
         print("[picker] Choose the window this run should use.")
         chosen = pick_window_interactive()
         if chosen is None and args.window is not None:
-            print(f"[picker] Nothing chosen; falling back to --window "
-                  f"{args.window}.")
+            print(f"[picker] Nothing chosen; falling back to "
+                  f"TARGET_WINDOW_HWND {args.window}.")
             return _window_info(args.window)
         return chosen
 
@@ -6228,82 +6223,36 @@ def choose_window(args, force_picker: bool = False) -> Optional[dict]:
 
 
 def main(argv: Optional[List[str]] = None) -> int:
-    args = build_parser().parse_args(argv)
-    # Training is unlimited unless the user asked for a finite run.
-    args = resolve_step_args(args)
+    args = build_config(argv)
 
     print("=" * 72)
     print("Background RL - Proof of Concept")
     print("=" * 72)
-
-    if args.list_windows:
-        windows = enumerate_windows(min_area=1)
-        print(format_window_table(windows))
-        print(f"\n{len(windows)} windows. Pass one with: "
-              f"python bot1.py --window <hwnd>")
-        return 0
 
     if sys.platform != "win32":
         print("[ERROR] This script relies on Win32 APIs (PrintWindow, "
               "RegisterHotKey, SendInput) and only runs on Windows.")
         return 2
 
-    recording_mode = bool(args.calibrate or args.watch)
-    # Calibration and watching are recording sessions, so always let the user
-    # pick the window from the list rather than trusting auto-detection: what
-    # you record must be the window you actually play in.
-    if args.pick or args.select:
-        force_picker = True
-    elif recording_mode and args.window is None:
-        force_picker = True
-        print("[picker] Calibrate/watch record real input, so the target window "
+    if args.diagnostic:
+        return run_diagnostic(args)
+
+    if args.calibrate:
+        # Calibration records real input, so always let the user pick the
+        # window from the list rather than trusting auto-detection: what you
+        # calibrate must be the window you actually play in.
+        print("[picker] Calibration records real input, so the target window "
               "is picked from the list.")
-    else:
-        force_picker = False
+        target = choose_window(args, force_picker=True)
+        if target is None:
+            print("[Cancelled] No target window selected.")
+            return 1
+        return run_calibration(target, args)
 
-    # A quick look at the whitelist needs no window at all.
-    if args.show_keymap or args.print_actions:
-        keymap, actions = build_action_set_for_args(args)
-        print()
-        print(f"Keymap   : {keymap.path or '(built-in defaults)'}")
-        print(f"Origin   : {keymap.origin}")
-        print(f"Keys     : {keymap.describe_keys()}")
-        print(f"Mouse    : turn {keymap.default_mouse_turn} px per action")
-        print(f"Actions  : {len(actions)}"
-              + (" (capped at MAX_ACTIONS)" if keymap.actions_capped else ""))
-        print("-" * 72)
-        for action in actions:
-            print(f"{action['id']:>4}  {action.get('label', '?'):<34} "
-                  f"{describe_action(action, keymap)}")
-        print("-" * 72)
-        return 0
-
-    target = choose_window(args, force_picker=force_picker)
+    target = choose_window(args, force_picker=False)
     if target is None:
         print("[Cancelled] No target window selected.")
         return 1
-
-    if args.diag_capture is not None:
-        return diag_capture(target["hwnd"], float(args.diag_capture))
-    if args.diag_input:
-        return diag_input(target["hwnd"], args.diag_input_key)
-    if args.diag_watch_safety:
-        return diag_watch_safety(target["hwnd"])
-    if args.release_keys:
-        return release_stuck_keys(target["hwnd"])
-
-    if args.calibrate:
-        return run_calibration(target, args)
-
-    if args.watch:
-        if win32gui.GetForegroundWindow() != target["hwnd"]:
-            print("[Watch] Click the game window so it has focus - your input "
-                  "is only recorded while it is focused.")
-        # Hand over to the watch session and return. Without this the run fell
-        # through into plain training below, which is exactly the "the bot is
-        # taking over while I am trying to teach it" failure: it would start
-        # driving the game instead of recording.
-        return run_watch_session(target, args)
 
     hwnd, pid = target["hwnd"], target["pid"]
     if not win32gui.IsWindow(hwnd):
@@ -6358,7 +6307,7 @@ def main(argv: Optional[List[str]] = None) -> int:
              if args.capture_delay else "")
           + ".")
     print(f"[Perf] Actions: {len(env.actions)} calibrated button combinations "
-          f"(print them with --print-actions)")
+          f"(set DIAGNOSTIC = \"actions\" to print them)")
 
     # Quick capability checks
     if not args.no_tests:
@@ -6386,12 +6335,12 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     loaded = None
     resume_path = None
-    # Resume happens automatically (RESUME_ON_START). --no-resume forces a
-    # fresh run; --resume <file> picks a specific checkpoint.
+    # Resume happens automatically (RESUME_ON_START); TARGET_WINDOW_HWND-style
+    # constants are the only way to opt out now.
     want_resume = RESUME_ON_START or bool(args.resume)
     if args.no_resume:
         want_resume = False
-        print("[Resume] Skipped (--no-resume); starting fresh.")
+        print("[Resume] Skipped (RESUME_ON_START = False); starting fresh.")
 
     if want_resume:
         if args.resume and args.resume != "auto":
@@ -6432,6 +6381,22 @@ def main(argv: Optional[List[str]] = None) -> int:
               "checkpoint) or Ctrl+C. Progress is checkpointed automatically, "
               "so restarting picks up where this left off.")
 
+    # Watch for you taking the controls, on a thread of its own so it stays
+    # responsive while the training loop is busy inside a PPO update.
+    human = HumanWatcher(target_hwnd=hwnd, keymap=keymap,
+                         ignored_vks=hotkey_vks(), verbose=True)
+    if human.start():
+        print(f"[Human] Watching for you: any real key press, mouse button or "
+              f"mouse movement hands the controls back to you, and the bot "
+              f"takes them again {HUMAN_RELEASE_GRACE_SECONDS:.0f}s after your "
+              f"last input.")
+    else:
+        for err in human.errors:
+            print(f"[Human] {err}")
+        print("[Human] WARNING: the input hooks could not be installed. The "
+              "key-state fallback still catches held keys, but mouse movement "
+              "will not hand the controls over. F8 always pauses the bot.")
+
     print()
     print("=" * 72)
     print("Training. The game window must stay focused for input to land.")
@@ -6439,6 +6404,8 @@ def main(argv: Optional[List[str]] = None) -> int:
           f"{env.keymap.path or 'the built-in defaults'}.")
     print(f"Rate: target {args.target_fps:.0f} steps/s at "
           f"{args.img_size}x{args.img_size}px - watch the [Perf] lines.")
+    print("Touch the keyboard or mouse at any time: the bot lets go instantly, "
+          "watches you, and takes over again 3s later.")
     print("=" * 72)
 
     try:
@@ -6454,8 +6421,10 @@ def main(argv: Optional[List[str]] = None) -> int:
             initial_model=loaded["model"] if loaded else None,
             initial_optimizer=loaded["optimizer"] if loaded else None,
             initial_step=initial_step,
+            human=human,
         )
     finally:
+        human.stop()
         env.close()
         print("[Done] Environment closed. Hotkeys released.")
 
