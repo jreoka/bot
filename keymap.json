@@ -1,0 +1,753 @@
+{
+  "version": 1,
+  "origin": "calibrated",
+  "created": "2026-09-16T12:37:47",
+  "updated": "2026-09-16T13:08:58",
+  "game": "Minecraft 26.3 - Singleplayer",
+  "game_hwnd": 2360648,
+  "game_resolution": [
+    1920,
+    1009
+  ],
+  "samples": 3299,
+  "allow_new_keys": true,
+  "default_mouse_turn": 10,
+  "mouse_sensitivity": {
+    "samples": 1,
+    "pixels_per_step": 10.0,
+    "max_pixels_per_step": 10.0
+  },
+  "keys": {
+    "W": {
+      "vk": 87,
+      "hold": "hold",
+      "source": "calibrated",
+      "count": 32,
+      "held_seconds": 28.768445199966663,
+      "max_hold": 7.8697282999928575
+    },
+    "A": {
+      "vk": 65,
+      "hold": "hold",
+      "source": "calibrated",
+      "count": 14,
+      "held_seconds": 8.0678687000036,
+      "max_hold": 1.4357106999959797
+    },
+    "S": {
+      "vk": 83,
+      "hold": "hold",
+      "source": "calibrated",
+      "count": 4,
+      "held_seconds": 3.5029499999945983,
+      "max_hold": 0.7005187000031583
+    },
+    "D": {
+      "vk": 68,
+      "hold": "hold",
+      "source": "calibrated",
+      "count": 6,
+      "held_seconds": 4.243873899948085,
+      "max_hold": 0.866586100004497
+    },
+    "SPACE": {
+      "vk": 32,
+      "hold": "hold",
+      "source": "default",
+      "count": 0,
+      "held_seconds": 0.0,
+      "max_hold": 0.0
+    },
+    "LSHIFT": {
+      "vk": 160,
+      "hold": "hold",
+      "source": "default",
+      "count": 0,
+      "held_seconds": 0.0,
+      "max_hold": 0.0
+    },
+    "LCTRL": {
+      "vk": 162,
+      "hold": "hold",
+      "source": "default",
+      "count": 0,
+      "held_seconds": 0.0,
+      "max_hold": 0.0
+    },
+    "E": {
+      "vk": 69,
+      "hold": "hold",
+      "source": "calibrated",
+      "count": 2,
+      "held_seconds": 1.7050559999916004,
+      "max_hold": 0.1338705999951344
+    },
+    "Q": {
+      "vk": 81,
+      "hold": "hold",
+      "source": "calibrated",
+      "count": 1,
+      "held_seconds": 0.16298310000274796,
+      "max_hold": 0.16298310000274796
+    },
+    "1": {
+      "vk": 49,
+      "hold": "tap",
+      "source": "default",
+      "count": 0,
+      "held_seconds": 0.0,
+      "max_hold": 0.0
+    },
+    "2": {
+      "vk": 50,
+      "hold": "tap",
+      "source": "default",
+      "count": 0,
+      "held_seconds": 0.0,
+      "max_hold": 0.0
+    },
+    "3": {
+      "vk": 51,
+      "hold": "tap",
+      "source": "default",
+      "count": 0,
+      "held_seconds": 0.0,
+      "max_hold": 0.0
+    },
+    "4": {
+      "vk": 52,
+      "hold": "tap",
+      "source": "default",
+      "count": 0,
+      "held_seconds": 0.0,
+      "max_hold": 0.0
+    },
+    "5": {
+      "vk": 53,
+      "hold": "tap",
+      "source": "default",
+      "count": 0,
+      "held_seconds": 0.0,
+      "max_hold": 0.0
+    },
+    "6": {
+      "vk": 54,
+      "hold": "tap",
+      "source": "default",
+      "count": 0,
+      "held_seconds": 0.0,
+      "max_hold": 0.0
+    },
+    "7": {
+      "vk": 55,
+      "hold": "tap",
+      "source": "default",
+      "count": 0,
+      "held_seconds": 0.0,
+      "max_hold": 0.0
+    },
+    "8": {
+      "vk": 56,
+      "hold": "tap",
+      "source": "default",
+      "count": 0,
+      "held_seconds": 0.0,
+      "max_hold": 0.0
+    },
+    "9": {
+      "vk": 57,
+      "hold": "tap",
+      "source": "default",
+      "count": 0,
+      "held_seconds": 0.0,
+      "max_hold": 0.0
+    }
+  },
+  "mouse_buttons": {
+    "MOUSE_LEFT": {
+      "count": 9,
+      "source": "default"
+    },
+    "MOUSE_RIGHT": {
+      "count": 7,
+      "source": "default"
+    },
+    "MOUSE_MIDDLE": {
+      "count": 0,
+      "source": "default"
+    }
+  },
+  "actions": [
+    {
+      "label": "noop",
+      "held": [],
+      "uses": [],
+      "tap": null,
+      "click": null,
+      "look": null,
+      "id": 0
+    },
+    {
+      "label": "replay:W+VK_20+VK_A2",
+      "held": [],
+      "uses": [
+        "HOLD_57",
+        "VK_20",
+        "VK_A2"
+      ],
+      "tap": null,
+      "click": null,
+      "look": null,
+      "id": 1
+    },
+    {
+      "label": "replay:W+VK_A2",
+      "held": [],
+      "uses": [
+        "HOLD_57",
+        "VK_A2"
+      ],
+      "tap": null,
+      "click": null,
+      "look": null,
+      "id": 2
+    },
+    {
+      "label": "replay:MOUSE_LEFT+W",
+      "held": [],
+      "uses": [
+        "HOLD_01",
+        "HOLD_57"
+      ],
+      "tap": null,
+      "click": null,
+      "look": null,
+      "id": 3
+    },
+    {
+      "label": "replay:VK_A0",
+      "held": [],
+      "uses": [
+        "VK_A0"
+      ],
+      "tap": null,
+      "click": null,
+      "look": null,
+      "id": 4
+    },
+    {
+      "label": "replay:A+W+VK_A2",
+      "held": [],
+      "uses": [
+        "HOLD_41",
+        "HOLD_57",
+        "VK_A2"
+      ],
+      "tap": null,
+      "click": null,
+      "look": null,
+      "id": 5
+    },
+    {
+      "label": "replay:VK_A2",
+      "held": [],
+      "uses": [
+        "VK_A2"
+      ],
+      "tap": null,
+      "click": null,
+      "look": null,
+      "id": 6
+    },
+    {
+      "label": "replay:D+W+VK_20+VK_A2",
+      "held": [],
+      "uses": [
+        "HOLD_44",
+        "HOLD_57",
+        "VK_20",
+        "VK_A2"
+      ],
+      "tap": null,
+      "click": null,
+      "look": null,
+      "id": 7
+    },
+    {
+      "label": "replay:MOUSE_LEFT+VK_A0",
+      "held": [],
+      "uses": [
+        "HOLD_01",
+        "VK_A0"
+      ],
+      "tap": null,
+      "click": null,
+      "look": null,
+      "id": 8
+    },
+    {
+      "label": "replay:A+W+VK_20+VK_A2",
+      "held": [],
+      "uses": [
+        "HOLD_41",
+        "HOLD_57",
+        "VK_20",
+        "VK_A2"
+      ],
+      "tap": null,
+      "click": null,
+      "look": null,
+      "id": 9
+    },
+    {
+      "label": "replay:D+W+VK_A2",
+      "held": [],
+      "uses": [
+        "HOLD_44",
+        "HOLD_57",
+        "VK_A2"
+      ],
+      "tap": null,
+      "click": null,
+      "look": null,
+      "id": 10
+    },
+    {
+      "label": "replay:D+VK_A2",
+      "held": [],
+      "uses": [
+        "HOLD_44",
+        "VK_A2"
+      ],
+      "tap": null,
+      "click": null,
+      "look": null,
+      "id": 11
+    },
+    {
+      "label": "hold:W",
+      "held": [
+        "HOLD_57"
+      ],
+      "uses": [],
+      "tap": null,
+      "click": null,
+      "look": null,
+      "id": 12
+    },
+    {
+      "label": "hold:A",
+      "held": [
+        "HOLD_41"
+      ],
+      "uses": [],
+      "tap": null,
+      "click": null,
+      "look": null,
+      "id": 13
+    },
+    {
+      "label": "hold:S",
+      "held": [
+        "HOLD_53"
+      ],
+      "uses": [],
+      "tap": null,
+      "click": null,
+      "look": null,
+      "id": 14
+    },
+    {
+      "label": "hold:D",
+      "held": [
+        "HOLD_44"
+      ],
+      "uses": [],
+      "tap": null,
+      "click": null,
+      "look": null,
+      "id": 15
+    },
+    {
+      "label": "hold:SPACE",
+      "held": [
+        "HOLD_20"
+      ],
+      "uses": [],
+      "tap": null,
+      "click": null,
+      "look": null,
+      "id": 16
+    },
+    {
+      "label": "hold:LSHIFT",
+      "held": [
+        "HOLD_A0"
+      ],
+      "uses": [],
+      "tap": null,
+      "click": null,
+      "look": null,
+      "id": 17
+    },
+    {
+      "label": "hold:LCTRL",
+      "held": [
+        "HOLD_A2"
+      ],
+      "uses": [],
+      "tap": null,
+      "click": null,
+      "look": null,
+      "id": 18
+    },
+    {
+      "label": "hold:E",
+      "held": [
+        "HOLD_45"
+      ],
+      "uses": [],
+      "tap": null,
+      "click": null,
+      "look": null,
+      "id": 19
+    },
+    {
+      "label": "hold:Q",
+      "held": [
+        "HOLD_51"
+      ],
+      "uses": [],
+      "tap": null,
+      "click": null,
+      "look": null,
+      "id": 20
+    },
+    {
+      "label": "hold:MOUSE_LEFT",
+      "held": [
+        "HOLD_01"
+      ],
+      "uses": [],
+      "tap": null,
+      "click": null,
+      "look": null,
+      "id": 21
+    },
+    {
+      "label": "hold:MOUSE_RIGHT",
+      "held": [
+        "HOLD_02"
+      ],
+      "uses": [],
+      "tap": null,
+      "click": null,
+      "look": null,
+      "id": 22
+    },
+    {
+      "label": "hold:MOUSE_MIDDLE",
+      "held": [
+        "HOLD_04"
+      ],
+      "uses": [],
+      "tap": null,
+      "click": null,
+      "look": null,
+      "id": 23
+    },
+    {
+      "label": "hold:W+A",
+      "held": [
+        "HOLD_57",
+        "HOLD_41"
+      ],
+      "uses": [],
+      "tap": null,
+      "click": null,
+      "look": null,
+      "id": 24
+    },
+    {
+      "label": "hold:W+S",
+      "held": [
+        "HOLD_57",
+        "HOLD_53"
+      ],
+      "uses": [],
+      "tap": null,
+      "click": null,
+      "look": null,
+      "id": 25
+    },
+    {
+      "label": "hold:W+D",
+      "held": [
+        "HOLD_57",
+        "HOLD_44"
+      ],
+      "uses": [],
+      "tap": null,
+      "click": null,
+      "look": null,
+      "id": 26
+    },
+    {
+      "label": "hold:A+S",
+      "held": [
+        "HOLD_41",
+        "HOLD_53"
+      ],
+      "uses": [],
+      "tap": null,
+      "click": null,
+      "look": null,
+      "id": 27
+    },
+    {
+      "label": "hold:A+D",
+      "held": [
+        "HOLD_41",
+        "HOLD_44"
+      ],
+      "uses": [],
+      "tap": null,
+      "click": null,
+      "look": null,
+      "id": 28
+    },
+    {
+      "label": "hold:S+D",
+      "held": [
+        "HOLD_53",
+        "HOLD_44"
+      ],
+      "uses": [],
+      "tap": null,
+      "click": null,
+      "look": null,
+      "id": 29
+    },
+    {
+      "label": "hold:SPACE+LSHIFT",
+      "held": [
+        "HOLD_20",
+        "HOLD_A0"
+      ],
+      "uses": [],
+      "tap": null,
+      "click": null,
+      "look": null,
+      "id": 30
+    },
+    {
+      "label": "hold:SPACE+LCTRL",
+      "held": [
+        "HOLD_20",
+        "HOLD_A2"
+      ],
+      "uses": [],
+      "tap": null,
+      "click": null,
+      "look": null,
+      "id": 31
+    },
+    {
+      "label": "hold:LSHIFT+LCTRL",
+      "held": [
+        "HOLD_A0",
+        "HOLD_A2"
+      ],
+      "uses": [],
+      "tap": null,
+      "click": null,
+      "look": null,
+      "id": 32
+    },
+    {
+      "label": "look_left",
+      "held": [],
+      "uses": [],
+      "tap": null,
+      "click": null,
+      "look": [
+        -10,
+        0
+      ],
+      "id": 33
+    },
+    {
+      "label": "look_right",
+      "held": [],
+      "uses": [],
+      "tap": null,
+      "click": null,
+      "look": [
+        10,
+        0
+      ],
+      "id": 34
+    },
+    {
+      "label": "look_up",
+      "held": [],
+      "uses": [],
+      "tap": null,
+      "click": null,
+      "look": [
+        0,
+        -10
+      ],
+      "id": 35
+    },
+    {
+      "label": "look_down",
+      "held": [],
+      "uses": [],
+      "tap": null,
+      "click": null,
+      "look": [
+        0,
+        10
+      ],
+      "id": 36
+    },
+    {
+      "label": "click:left",
+      "held": [],
+      "uses": [],
+      "tap": null,
+      "click": "left",
+      "look": null,
+      "id": 37
+    },
+    {
+      "label": "click:right",
+      "held": [],
+      "uses": [],
+      "tap": null,
+      "click": "right",
+      "look": null,
+      "id": 38
+    },
+    {
+      "label": "click:middle",
+      "held": [],
+      "uses": [],
+      "tap": null,
+      "click": "middle",
+      "look": null,
+      "id": 39
+    },
+    {
+      "label": "hold:W+look_left",
+      "held": [
+        "HOLD_57"
+      ],
+      "uses": [],
+      "tap": null,
+      "click": null,
+      "look": [
+        -10,
+        0
+      ],
+      "id": 40
+    },
+    {
+      "label": "hold:W+look_right",
+      "held": [
+        "HOLD_57"
+      ],
+      "uses": [],
+      "tap": null,
+      "click": null,
+      "look": [
+        10,
+        0
+      ],
+      "id": 41
+    },
+    {
+      "label": "tap:1",
+      "held": [],
+      "uses": [],
+      "tap": "1",
+      "click": null,
+      "look": null,
+      "id": 42
+    },
+    {
+      "label": "tap:2",
+      "held": [],
+      "uses": [],
+      "tap": "2",
+      "click": null,
+      "look": null,
+      "id": 43
+    },
+    {
+      "label": "tap:3",
+      "held": [],
+      "uses": [],
+      "tap": "3",
+      "click": null,
+      "look": null,
+      "id": 44
+    },
+    {
+      "label": "tap:4",
+      "held": [],
+      "uses": [],
+      "tap": "4",
+      "click": null,
+      "look": null,
+      "id": 45
+    },
+    {
+      "label": "tap:5",
+      "held": [],
+      "uses": [],
+      "tap": "5",
+      "click": null,
+      "look": null,
+      "id": 46
+    },
+    {
+      "label": "tap:6",
+      "held": [],
+      "uses": [],
+      "tap": "6",
+      "click": null,
+      "look": null,
+      "id": 47
+    },
+    {
+      "label": "tap:7",
+      "held": [],
+      "uses": [],
+      "tap": "7",
+      "click": null,
+      "look": null,
+      "id": 48
+    },
+    {
+      "label": "tap:8",
+      "held": [],
+      "uses": [],
+      "tap": "8",
+      "click": null,
+      "look": null,
+      "id": 49
+    },
+    {
+      "label": "tap:9",
+      "held": [],
+      "uses": [],
+      "tap": "9",
+      "click": null,
+      "look": null,
+      "id": 50
+    }
+  ],
+  "actions_capped": false
+}
