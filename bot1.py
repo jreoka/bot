@@ -336,10 +336,10 @@ BATCH_SIZE = 8
 TARGET_FPS = 20.0
 CAPTURE_DELAY = 0.0                # extra seconds slept between steps
 IMG_SIZE = 160
-SEQ_LEN = 8
+SEQ_LEN = 128
 DEVICE = "auto"                    # auto | cuda | cpu
-PRIORITY = "below_normal"          # below_normal | normal | high
-SHOW_PREVIEW = False               # small live view of what the model sees
+PRIORITY = "normal"          # below_normal | normal | high
+SHOW_PREVIEW = True               # small live view of what the model sees
 ENABLE_HOTKEYS = True              # global pause / save / quit hotkeys
 RUN_STARTUP_TESTS = True           # capture/audio/input checks at startup
 
