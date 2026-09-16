@@ -329,7 +329,7 @@ BATCH_SIZE = 8
 # 160px/30Hz the loop reacts in about 33 ms, which is fast enough to answer most
 # things a game throws at you. Raise CAPTURE_DELAY or lower TARGET_FPS if the
 # game stutters (watch the [Perf] line).
-TARGET_FPS = 30.0
+TARGET_FPS = 20.0
 CAPTURE_DELAY = 0.0                # extra seconds slept between steps
 IMG_SIZE = 160
 SEQ_LEN = 8
@@ -344,7 +344,7 @@ RUN_STARTUP_TESTS = True           # capture/audio/input checks at startup
 # simulating or stop rendering while unfocused, which leaves the bot training
 # on a still image; the only fix is a game setting or a different window mode.
 # Set to 0 to disable.
-FROZEN_WARN_SECONDS = 15.0
+FROZEN_WARN_SECONDS = 150.0
 
 # ---- input ------------------------------------------------------------------
 # How long a momentary press lasts (seconds). Buttons the bot wants to keep
