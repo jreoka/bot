@@ -57,10 +57,13 @@ CALIBRATION
 
   The action space is built from that keymap and is then frozen for the life of
   the checkpoints: it is what the policy head is sized to, and a checkpoint is
-  only resumable while it still matches. Buttons you press while playing that
-  the keymap does not know are discovered, added to keymap.json and saved, but
-  they only join the action set the next time it is rebuilt with --calibrate
-  (which starts a fresh policy, as changing the action space always does).
+  only resumable while it still matches. The set is rebuilt from the keymap at
+  every launch - single holds, WASD diagonals, the movement keys crossed with
+  space/shift/ctrl, a hold with a turn, taps, clicks, plus every button
+  combination you demonstrated that the defaults do not already cover. Buttons
+  you press while playing that the keymap does not know are discovered, added
+  to keymap.json, and become pressable at the next launch (which starts a fresh
+  policy, because the action space changed size).
 
 HOW IT LEARNS FROM YOU
   Every takeover is recorded as (frame -> the buttons you were holding and how
@@ -246,6 +249,7 @@ import itertools
 import json
 import os
 import queue
+import re
 import signal
 import sys
 import threading
@@ -909,8 +913,10 @@ class Keymap:
     Built once by --calibrate, then reloaded by every run. While a training run
     is watching you play, any *new* key you press is folded in and written back
     to disk, so the keymap grows with you instead of needing a fresh
-    calibration run every time you rebind something. (It joins the action set,
-    and so the policy, the next time the keymap is rebuilt by --calibrate.)
+    calibration run every time you rebind something. The action set is rebuilt
+    from the keymap at each launch, so such a key becomes pressable then - and
+    because the action space changes size when that happens, that launch starts
+    a fresh policy.
     """
 
     VERSION = 1
@@ -1194,8 +1200,10 @@ def build_action_set(keymap: Optional[Keymap] = None,
         * ``held``  - buttons held down for the duration of the step. These are
                       real keys that stay pressed, so the bot can walk, sprint,
                       sneak or swim continuously instead of re-tapping.
-        * ``uses``  - "hold the buttons the human was holding here". Only used
-                      by the behavioral-cloning pass over recorded play.
+        * ``uses``  - the same thing, for a combination that came out of your
+                      own play (a recorded "replay:" action). Both fields are
+                      resolved to virtual keys the same way when the action is
+                      applied.
         * ``tap``   - a button pressed and released inside the step.
         * ``click`` - a mouse button clicked inside the step.
         * ``look``  - a relative mouse turn, which is the only thing games'
@@ -1203,8 +1211,9 @@ def build_action_set(keymap: Optional[Keymap] = None,
 
     One action covers buttons + a click + a turn at once, so the bot can learn
     combinations like "hold W, jump" or "hold W and D, click" as single
-    decisions. The list is capped; when it overflows, the least important
-    combinations are dropped and ``capped`` comes back True.
+    decisions, and it can hold up to four buttons at once when you demonstrated
+    such a combination. The list is capped; when it overflows, the least
+    important combinations are dropped and ``capped`` comes back True.
     """
     keymap = keymap or Keymap.default()
 
@@ -1233,24 +1242,32 @@ def build_action_set(keymap: Optional[Keymap] = None,
                        "tap": None, "click": None, "look": None})
 
     holds = _hold_tokens(keymap)
-    default_holds = [keymap.hold_name(keymap.vk(n) or 0) for n in DEFAULT_HOLD_KEYS]
-    default_holds = [t for t in default_holds if t in holds]
+
+    def hold_tokens_for(names) -> List[str]:
+        tokens = [keymap.hold_name(keymap.vk(n) or 0) for n in names
+                  if keymap.is_hold(n)]
+        return [t for t in tokens if t in holds]
+
+    movement = hold_tokens_for(("W", "A", "S", "D"))
+    timed = hold_tokens_for(("SPACE", "LSHIFT", "LCTRL"))
 
     # Continuous holds on their own - the core of "hold the button down".
     for token in holds:
         add_hold([token], 2)
 
-    # Diagonals (W+D, W+A, ...) and the common pairs, so the bot can move at an
-    # angle or sprint ("W" held together with the sprint key) as one decision.
-    pair_groups = [default_holds[:4],                       # W A S D diagonals
-                   [keymap.hold_name(keymap.vk(n) or 0)
-                    for n in ("SPACE", "LSHIFT", "LCTRL")
-                    if keymap.is_hold(n)]]                  # timed holds
-    for group in pair_groups:
-        group = [t for t in group if t in holds]
+    # Diagonals (W+A, W+D, ...) and the pairs inside the timed group, so the
+    # bot can move at an angle, or jump and sprint, as one decision.
+    for group in (movement, timed):
         for i in range(len(group)):
             for j in range(i + 1, len(group)):
                 add_hold([group[i], group[j]], 3)
+
+    # Movement crossed with the timed buttons - "run forward", "sprint at an
+    # angle", "jump while strafing" - which neither group can express on its
+    # own, and which a player does constantly.
+    for move in movement:
+        for extra in timed:
+            add_hold([move, extra], 4)
 
     # Momentary taps of non-hold keys, if the keymap allows them.
     for name in sorted(keymap.keys, key=_key_priority):
@@ -1272,7 +1289,7 @@ def build_action_set(keymap: Optional[Keymap] = None,
                                        "uses": [], "tap": None,
                                        "click": button, "look": None})
     if keymap.mouse_button_name("left"):
-        forward = default_holds[:1]
+        forward = movement[:1]
         for label, dx, dy in (("look_left", -turn, 0), ("look_right", turn, 0)):
             add(8, ("hold", tuple(forward), "look", label),
                 {"label": (f"hold:{_hold_label(keymap, forward[0])}+{label}"
@@ -1280,18 +1297,32 @@ def build_action_set(keymap: Optional[Keymap] = None,
                  "held": list(forward), "uses": [], "tap": None,
                  "click": None, "look": [dx, dy]})
 
-    # Behavioral-cloning actions: exactly the button sets the human used, so
-    # the policy can reproduce combinations the defaults never imagined (and,
-    # with a turn attached, so imitation can say "walk and look" at once).
+    # Button combinations from your own play, so the policy can reproduce
+    # something the defaults never imagined. Each stored button is resolved to
+    # a real key of *this* keymap: a combination that this keymap cannot press
+    # is skipped outright rather than quietly pressed in part, which is what
+    # used to turn "hold W and space and ctrl" into "hold W".
     for spec in keymap.actions:
-        uses = tuple(_uses_tokens(keymap, spec.get("uses")))
-        if not uses or uses in covered_button_sets:
-            continue                      # already covered by a plain hold
-        covered_button_sets.add(uses)
+        stored = list(spec.get("uses") or []) + list(spec.get("held") or [])
+        if not stored:
+            continue
+        buttons: List[str] = []
+        for token in stored:
+            canon = _canonical_hold_token(keymap, token)
+            if canon is None:
+                buttons = []
+                break
+            if canon not in buttons:
+                buttons.append(canon)     # keep the order you pressed them in
+        if not buttons:
+            continue                      # a combination this keymap cannot press
+        if tuple(sorted(buttons)) in covered_button_sets:
+            continue                      # already covered by a generated action
+        covered_button_sets.add(tuple(sorted(buttons)))
         look = tuple(spec["look"]) if spec.get("look") else ()
-        add(1, ("uses", uses, look),
-            {"label": spec.get("label", "replay"),
-             "held": [], "uses": list(uses), "tap": None, "click": None,
+        add(1, ("uses", tuple(buttons), look),
+            {"label": "replay:" + "+".join(_hold_label(keymap, t) for t in buttons),
+             "held": [], "uses": list(buttons), "tap": None, "click": None,
              "look": list(look) if look else None})
 
     ordered.sort(key=lambda item: item[0])
@@ -1322,6 +1353,190 @@ def _hold_label(keymap: Keymap, token: Optional[str]) -> str:
         if keymap.button_vk(name) == vk:
             return name
     return f"0x{vk:02X}"
+
+
+# A button name an older build wrote down because it could not name the key:
+# the low-level hooks report the *sided* modifier codes (VK_LSHIFT == 0xA0,
+# VK_LCONTROL == 0xA2, ...) and the name table used to have no entry for them,
+# so a recorded "hold shift" was stored as the literal string "VK_A0". Those
+# names match no key in keymap.json, so they were dropped at press time.
+_STALE_VK_TOKEN = re.compile(r"^VK_([0-9A-F]{1,2})$")
+
+
+def _keymap_vks(keymap: Keymap) -> set:
+    """Every virtual key this keymap is allowed to press."""
+    vks = {int(entry.get("vk") or 0) for entry in keymap.keys.values()}
+    vks |= {keymap.button_vk(name) or 0 for name in keymap.mouse_buttons}
+    vks.discard(0)
+    return vks
+
+
+def _canonical_hold_token(keymap: Keymap, token) -> Optional[str]:
+    """
+    The canonical HOLD_xx token for a stored button name, or None when this
+    keymap cannot press it.
+
+    Handles the three shapes that turn up in a saved action list: a HOLD_xx
+    token, a plain key name ("W", "SPACE", "MOUSE_LEFT"), and a stale "VK_xx"
+    name from an older recording, which is decoded and looked up by code so
+    that "VK_A2" becomes the LCTRL the keymap already knows about.
+    """
+    text = str(token or "").upper().strip()
+    if not text:
+        return None
+    known = _keymap_vks(keymap)
+
+    if text.startswith("HOLD_"):
+        vk = keymap.hold_vk(text)
+        return keymap.hold_name(vk) if vk in known else None
+
+    vk = keymap.vk(text) or keymap.button_vk(text)
+    if vk:
+        return keymap.hold_name(int(vk))
+
+    match = _STALE_VK_TOKEN.match(text)
+    if match and int(match.group(1), 16) in known:
+        return keymap.hold_name(int(match.group(1), 16))
+    return None
+
+
+class ActionRepair:
+    """What normalize_action_set changed, so it can be reported and saved."""
+
+    def __init__(self):
+        self.renamed: Dict[str, str] = {}
+        self.repaired = 0            # button names translated to real keys
+        self.dropped_buttons = 0     # buttons this keymap cannot press
+        self.dropped_unpressable = 0  # actions dropped because of those
+        self.dropped_actions = 0     # actions that duplicated an earlier one
+        self.kept = 0
+
+    @property
+    def changed(self) -> bool:
+        return bool(self.repaired or self.dropped_buttons
+                    or self.dropped_actions or self.dropped_unpressable)
+
+    def summary(self) -> str:
+        parts = []
+        if self.repaired:
+            shown = ", ".join(f"{old} -> {new}"
+                              for old, new in sorted(self.renamed.items())[:6])
+            parts.append(f"translated {self.repaired} stored button name(s) "
+                         f"({shown})")
+        if self.dropped_unpressable:
+            parts.append(f"removed {self.dropped_unpressable} action(s) this "
+                         f"keymap cannot press")
+        if self.dropped_buttons and not self.dropped_unpressable:
+            parts.append(f"dropped {self.dropped_buttons} button(s) this keymap "
+                         f"cannot press")
+        if self.dropped_actions:
+            parts.append(f"removed {self.dropped_actions} action(s) that did "
+                         f"exactly what another one does")
+        return "; ".join(parts) if parts else "no changes"
+
+
+def _action_signature(keymap: Keymap, action: dict) -> tuple:
+    """
+    What an action actually does, as a comparable key: the buttons it presses
+    (by virtual key, so a name and its HOLD_xx token compare equal), the turn,
+    the tap and the click.
+    """
+    vks = {keymap.hold_vk(token) or 0
+           for token in list(action.get("held") or []) + list(action.get("uses") or [])}
+    vks.discard(0)
+    tap = action.get("tap")
+    return (tuple(sorted(vks)),
+            tuple(action.get("look") or ()),
+            str(tap).upper() if tap else "",
+            str(action.get("click") or ""))
+
+
+def normalize_action_set(keymap: Keymap, actions: List[dict]
+                         ) -> Tuple[List[dict], ActionRepair]:
+    """
+    Make a stored action list pressable, and free of clones.
+
+    Two things happen here:
+
+      * every button name is resolved against this keymap, so a name an older
+        build could not interpret ("VK_20" for space) becomes the real button
+        instead of being skipped when the action is applied. An action whose
+        buttons this keymap does not have at all is removed rather than
+        silently weakened - "hold W, space and ctrl" must not quietly become
+        "hold W";
+      * actions that would do exactly the same thing are collapsed, so the
+        policy is not choosing between clones and splitting its probability
+        across them.
+
+    Ids are renumbered, because the id *is* the policy's action index.
+    """
+    out: List[dict] = []
+    seen = set()
+    report = ActionRepair()
+
+    for action in actions:
+        spec = dict(action)
+        unpressable = False
+        for field in ("held", "uses"):
+            resolved = []
+            for token in (spec.get(field) or []):
+                canon = _canonical_hold_token(keymap, token)
+                if canon is None:
+                    report.dropped_buttons += 1
+                    unpressable = True
+                    continue
+                if canon != str(token).upper():
+                    report.repaired += 1
+                    report.renamed[str(token)] = _hold_label(keymap, canon)
+                    spec["label"] = str(spec.get("label") or "").replace(
+                        str(token), _hold_label(keymap, canon))
+                resolved.append(canon)
+            spec[field] = resolved
+        if unpressable:
+            # Deliberately not kept as a weakened version of itself: "hold W,
+            # space and ctrl" must not quietly become "hold W".
+            report.dropped_unpressable += 1
+            continue
+
+        tap = spec.get("tap")
+        if tap:
+            if not (keymap.vk(tap) or BackgroundInput.VK.get(str(tap).upper())):
+                canon = _canonical_hold_token(keymap, tap)
+                if canon:
+                    report.repaired += 1
+                    report.renamed[str(tap)] = _hold_label(keymap, canon)
+                    spec["label"] = str(spec.get("label") or "").replace(
+                        str(tap), _hold_label(keymap, canon))
+                    spec["tap"] = _hold_label(keymap, canon)
+                else:
+                    report.dropped_unpressable += 1
+                    continue
+
+        signature = _action_signature(keymap, spec)
+        if signature in seen:
+            report.dropped_actions += 1
+            continue
+        seen.add(signature)
+        out.append(spec)
+
+    if not out:
+        out = [{"label": "noop", "held": [], "uses": [], "tap": None,
+                "click": None, "look": None}]
+    for index, spec in enumerate(out):
+        spec["id"] = index
+    report.kept = len(out)
+    return out, report
+
+
+def action_list_signature(actions: List[dict]) -> tuple:
+    """Comparable form of a whole action list, for 'did the rebuild change it?'"""
+    return tuple((a.get("label"),
+                  tuple(a.get("held") or []),
+                  tuple(a.get("uses") or []),
+                  tuple(a.get("look") or ()),
+                  a.get("tap") or "",
+                  a.get("click") or "")
+                 for a in actions)
 
 
 def describe_actions(actions: List[dict]) -> str:
@@ -2276,11 +2491,18 @@ LLKHF_INJECTED = 0x10
 
 def build_action_set_for_args(args) -> Tuple[Optional[Keymap], List[dict]]:
     """
-    Keymap -> action-set pipeline, shared by calibration and training so both
-    always agree on what the bot is allowed to do.
+    Keymap -> action-set pipeline, used by both training and the diagnostics,
+    so they always agree on what the bot is allowed to do.
+
+    The set is rebuilt from the keymap on every launch rather than replayed
+    from the list that was saved last time. The generator improves (new button
+    combinations, better names), and a stored list can hold button names an
+    older build spelled differently; the combinations that came out of your own
+    play are folded back in from keymap.actions by build_action_set() itself,
+    so nothing you demonstrated is lost. The rebuilt list is then repaired and
+    de-duplicated, and written back if that changed anything.
     """
     path = os.path.abspath(args.keymap)
-    always_rebuild = bool(getattr(args, "fresh_keymap", False))
     keymap = Keymap.load(path, required=False)
     if keymap is None:
         keymap = Keymap.default()
@@ -2290,10 +2512,39 @@ def build_action_set_for_args(args) -> Tuple[Optional[Keymap], List[dict]]:
         else:
             print(f"[Keymap] No keymap at '{path}'; using the built-in default "
                   f"keys. Run --calibrate to choose your own.")
-    actions = list(keymap.actions)
-    if always_rebuild or not actions:
-        actions, capped = build_action_set(keymap)
-        keymap.set_actions(actions, capped)
+
+    original = list(keymap.actions)
+    if original:
+        # Repair what was saved *before* rebuilding, so the log can say which
+        # stored button names were translated, and so the rebuild folds in
+        # combinations this keymap can actually press.
+        repaired_stored, stored_report = normalize_action_set(keymap, original)
+        keymap.set_actions(repaired_stored, keymap.actions_capped)
+    else:
+        stored_report = ActionRepair()
+
+    actions, capped = build_action_set(keymap)
+    actions, report = normalize_action_set(keymap, actions)
+    keymap.set_actions(actions, capped)
+
+    for outcome in (stored_report, report):
+        if outcome.changed:
+            print(f"[Actions] {outcome.summary()}")
+    if original and len(actions) != len(original):
+        print(f"[Actions] Action set rebuilt from the keymap: "
+              f"{len(original)} -> {len(actions)} stored action(s)"
+              + (" (capped at MAX_ACTIONS)" if capped else ""))
+
+    changed = (stored_report.changed or report.changed
+               or action_list_signature(actions) != action_list_signature(original))
+    # Persist the rebuilt list, but only when there was already a keymap file: a
+    # run that fell back to the built-in defaults should not create one.
+    if keymap.path and changed:
+        try:
+            keymap.save()
+            print(f"[Actions] Saved the updated keymap -> {keymap.path}")
+        except Exception as exc:
+            print(f"[Actions] Could not save the updated keymap: {exc}")
     return keymap, actions
 
 
@@ -2921,9 +3172,10 @@ class HumanWatcher:
         """
         Remember a button the calibrated keymap does not know about yet.
 
-        It goes into keymap.json but not into this run's action set: the action
-        space is what the policy head is sized to, so it only changes when the
-        keymap is rebuilt by --calibrate.
+        It goes into keymap.json now, and the action set is rebuilt from the
+        keymap at the start of the next launch, so it becomes something the bot
+        can actually press - at the cost of a fresh policy, because the action
+        space (and so the policy head) has changed size.
         """
         if self.keymap is None:
             return
@@ -2932,14 +3184,14 @@ class HumanWatcher:
                 self.new_keys.append(name)
                 if self.verbose:
                     print(f"[Human] New mouse button: {name} - it is in the "
-                          f"keymap now, but only joins the action set on the "
-                          f"next --calibrate.")
+                          f"keymap now and joins the action set at the next "
+                          f"launch.")
             return
         if self.keymap.allow(name, source="discovered", hold="hold"):
             self.new_keys.append(name)
             if self.verbose:
-                print(f"[Human] New key: {name} - it is in the keymap now, but "
-                      f"only joins the action set on the next --calibrate.")
+                print(f"[Human] New key: {name} - it is in the keymap now and "
+                      f"joins the action set at the next launch.")
 
     # ---- state the training loop reads ----
     def human_active(self, bot_held_vks=(),
