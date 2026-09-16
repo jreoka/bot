@@ -5427,7 +5427,7 @@ def train_ppo(
           f"--checkpoint-dir \"{checkpoint_manager.directory}\"")
     print("-" * 72)
     print()
-    print("[Training] Starting. You can use your machine normally.")
+    print("[Training] Starting...")
 
     interrupted = False
     try:
