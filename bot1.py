@@ -14,16 +14,58 @@ from collections import deque
 from datetime import datetime
 from typing import Dict, List, Optional, Tuple
 
-import win32process
+
+def _require(module: str, pip_name: str = None):
+    """
+    Import a hard dependency, or exit with one readable line.
+
+    On a machine that has only just been handed this script, a missing wheel
+    should say which package to install rather than dying with a bare
+    ModuleNotFoundError from somewhere deep in the import block.
+    """
+    try:
+        return __import__(module)
+    except ImportError as exc:
+        pkg = pip_name or module
+        print(f"[Setup] Missing Python package '{pkg}' ({exc}).")
+        print(f"[Setup] Install the training dependencies with:")
+        print(f"[Setup]   python -m pip install torch numpy opencv-python "
+              f"gymnasium pywin32 prodigyopt soundcard")
+        sys.exit(2)
+
+
+_require("numpy")
+_require("torch")
+if os.name == "nt":
+    _require("win32process", "pywin32")
+    _require("win32gui", "pywin32")
+    _require("win32api", "pywin32")
+    _require("win32ui", "pywin32")
+    _require("win32con", "pywin32")
 
 import numpy as np
 import cv2
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import win32gui
-import win32api
-import win32ui
+if os.name == "nt":
+    import win32process
+    import win32gui
+    import win32api
+    import win32ui
+    import win32con
+else:
+    # The script is a Windows tool (PrintWindow capture plus SendInput). These
+    # placeholders exist only so the model, the config and the checkpoint logic
+    # can still be imported and unit-tested on another platform; anything that
+    # actually touches a window fails loudly with a readable message instead of
+    # an AttributeError on None.
+    def _windows_only(*_args, **_kwargs):
+        raise RuntimeError(
+            "window capture and input injection are Windows-only; "
+            "this module is only importable elsewhere for testing")
+
+    win32process = win32gui = win32api = win32ui = win32con = None  # type: ignore
 try:
     import soundcard as sc
     _HAS_SOUNDCARD = True
@@ -31,9 +73,12 @@ except ImportError:
     _HAS_SOUNDCARD = False
     print("[Audio] 'soundcard' not installed; audio will be silence.")
     print("        Install with: python -m pip install soundcard")
+_require("gymnasium", "gymnasium")
 import gymnasium as gym
 from gymnasium import spaces
+_require("prodigyopt", "prodigyopt")
 from prodigyopt import Prodigy
+
 
 
 # =============================================================================
@@ -83,21 +128,73 @@ PREFER_GAME_WINDOW = True
 FOREVER = "forever"
 FOREVER_STEPS = 10 ** 12            # effectively unlimited: ~1000 years at 30 Hz
 TOTAL_STEPS = FOREVER              # forever | an int, e.g. 100_000
-BATCH_SIZE = 8
+BATCH_SIZE = 16                     # transitions per PPO update
 # Control rate. TARGET_FPS is the wall-clock ceiling on how often the bot sees
 # the screen and can act; CAPTURE_DELAY is an extra sleep on top of that. At
-# 160px/30Hz the loop reacts in about 33 ms, which is fast enough to answer most
+# 96px/20Hz the loop reacts in about 50 ms, which is fast enough to answer most
 # things a game throws at you. Raise CAPTURE_DELAY or lower TARGET_FPS if the
 # game stutters (watch the [Perf] line).
 TARGET_FPS = 20.0
 CAPTURE_DELAY = 0.0                # extra seconds slept between steps
-IMG_SIZE = 160
-SEQ_LEN = 128
+# ---- observation size: the single biggest lever on CPU cost -----------------
+# These defaults are sized for a 6-core laptop CPU with no CUDA, and were
+# measured on one (Ryzen 5 7530U): a whole PPO update here costs about 0.6 s of
+# CPU, roughly 60% of wall clock left for actually playing the game.
+#
+# What actually drives the cost, in order:
+#   1. SEQ_LEN - every frame is a full CNN pass, and attention is SEQ_LEN^2.
+#      Halving it roughly halves the update.
+#   2. the raw-audio CNN (the model pools the waveform by AUDIO_DOWNSAMPLE
+#      first, which is worth about 3.5x on its own; see SECTION 3).
+#   3. IMG_SIZE - much weaker than it looks, because the stride-4 first conv
+#      dominates and its cost is nearly flat from 64px to 96px. 96px is
+#      therefore kept for visual detail; it is not what is slowing you down.
+# Raise these only if the [Perf] line in the log shows room to spare.
+IMG_SIZE = 96
+SEQ_LEN = 16
 DEVICE = "auto"                    # auto | cuda | cpu
 PRIORITY = "normal"          # below_normal | normal | high
 SHOW_PREVIEW = True               # small live view of what the model sees
 ENABLE_HOTKEYS = True              # global pause / save / quit hotkeys
 RUN_STARTUP_TESTS = True           # capture/audio/input checks at startup
+
+# ---- transformer / PPO update budget ----------------------------------------
+# The model is a SwiGLU + RoPE transformer (SECTION 3). These knobs are what
+# keep a CPU run moving instead of appearing to hang:#   * MINIBATCH_SIZE splits each PPO epoch into small backward passes. Smaller
+#     passes are also what makes the update fit in cache on a weak CPU, so this
+#     is usually faster AND better for the optimizer than one big batch. On the
+#     reference machine 8 measured slightly faster than 4 or 16.
+#   * UPDATE_SECONDS_BUDGET caps how long a single PPO update may keep looping
+#     over minibatches; once exceeded, that update stops where it is and
+#     control returns to the game. This is the hard guarantee against a stall:
+#     no single update can run away with the whole run.
+#   * The optimizer gets a short warmup then a cosine decay to LR_MIN_FRACTION,
+#     which is what stops the policy from oscillating forever without ever
+#     converging once the novelty bonus inevitably shrinks.
+MINIBATCH_SIZE = 8
+UPDATE_SECONDS_BUDGET = 20.0        # 0 disables the cap
+EPOCHS_PER_UPDATE = 2               # passes over each rollout
+# Optimizer. "adam" is the predictable choice: pair it with the warmup/cosine
+# schedule below and convergence is monotone. "prodigy" needs no learning rate
+# (leave OPTIMIZER_LR at 1.0) but it estimates its own step size, so the decay
+# schedule below fights it; use Prodigy only when you set LR_DECAY_UPDATES high
+# and LR_MIN_FRACTION to 1.0.
+OPTIMIZER_KIND = "adam"             # adam | prodigy
+OPTIMIZER_LR = 3e-4
+LR_WARMUP_UPDATES = 20              # updates spent ramping the LR up
+LR_DECAY_UPDATES = 5000             # updates over which it cosine-decays
+LR_MIN_FRACTION = 0.1               # floor of the decay, as a fraction of base
+GRAD_CLIP_NORM = 1.0                # was 0.5; 1.0 is the PPO default
+# Transformer shape. num_heads must divide VISUAL_DIM.
+VISUAL_DIM = 128
+AUDIO_DIM = 64
+HIDDEN_DIM = 128
+NUM_BLOCKS = 2
+NUM_HEADS = 4
+FFN_HIDDEN = None                   # None = the standard 2/3 * 4 * d_model
+DROPOUT = 0.0
+SEQ_POOL = "last"                   # last | mean | max
+AUDIO_DOWNSAMPLE = 8                # average-pool the waveform before the CNN
 
 # ---- frozen-window watchdog -------------------------------------------------
 # Warn when screen-grab frames stop changing for this long. Many games stop
@@ -249,7 +346,7 @@ ENTROPY_COEF_DECAY = 0.995   # decay per update once entropy is healthy
 # checkpoint written by an older version is refused (the run starts fresh)
 # rather than silently resuming a policy that was trained against a different
 # objective - which is exactly how you end up babysitting a noop policy.
-REWARD_VERSION = 2
+REWARD_VERSION = 3
 
 
 # =============================================================================
@@ -4004,64 +4101,223 @@ class SignalController:
 
 
 # =============================================================================
-# SECTION 3: MULTI-HEAD gMLP MODEL
+# SECTION 3: SwiGLU + RoPE TRANSFORMER MODEL
+#
+# Two small causal transformers: one over visual frame tokens, one over audio
+# frame tokens. Each frame is compressed to a single token by a convolutional
+# encoder, then the sequence is mixed by pre-norm blocks that use
+#   * rotary position embeddings (RoPE) on queries and keys, so attention is
+#     relative and position handling costs no parameters, and
+#   * a SwiGLU feed-forward network, which is the gated MLP that replaced the
+#     plain 2-layer MLP in modern transformers
+#     (SwiGLU(x) = W_down( SiLU(W_gate x) * W_up x )).
+#
+# Everything here is deliberately shaped for a CPU: attention is O(T^2) in the
+# *sequence of frames* (SEQ_LEN), never in pixels, and the CNN does the heavy
+# lifting on the image.
 # =============================================================================
 
-class SpatialGatingUnit(nn.Module):
-    """Spatial Gating Unit from 'Pay Attention to MLPs' (gMLP)."""
 
-    def __init__(self, d_model: int, seq_len: int):
+class RMSNorm(nn.Module):
+    """Root-mean-square layer norm (no mean subtraction, no bias)."""
+
+    def __init__(self, dim: int, eps: float = 1e-6):
         super().__init__()
-        self.norm = nn.LayerNorm(d_model)
-        self.proj = nn.Linear(seq_len, seq_len)
-        self.bias = nn.Parameter(torch.zeros(seq_len, d_model))
+        self.eps = float(eps)
+        self.weight = nn.Parameter(torch.ones(dim))
 
     def forward(self, x):
-        residual = x
-        x = self.norm(x)
-        x = x.transpose(1, 2)
-        x = self.proj(x)
-        x = x.transpose(1, 2)
-        x = x + self.bias
-        return x * residual
+        # Compute the norm in float32 so a half-precision run stays stable.
+        dtype = x.dtype
+        x32 = x.float()
+        x32 = x32 * torch.rsqrt(x32.pow(2).mean(-1, keepdim=True) + self.eps)
+        return (x32.to(dtype)) * self.weight
 
 
-class gMLPBlock(nn.Module):
-    def __init__(self, d_model: int, d_ff: int, seq_len: int):
-        super().__init__()
-        self.norm = nn.LayerNorm(d_model)
-        self.fc1 = nn.Linear(d_model, d_ff)
-        self.fc2 = nn.Linear(d_ff, d_model)
-        self.sgu = SpatialGatingUnit(d_ff, seq_len)
-
-    def forward(self, x):
-        residual = x
-        x = self.norm(x)
-        x = self.fc1(x)
-        x = F.gelu(x)
-        x = self.sgu(x)
-        x = self.fc2(x)
-        return x + residual
+def _rotate_half(x):
+    half = x.shape[-1] // 2
+    x1, x2 = x[..., :half], x[..., half:]
+    return torch.cat((-x2, x1), dim=-1)
 
 
-class MultiHeadgMLP(nn.Module):
+class RotaryEmbedding(nn.Module):
     """
-    Multi-head gMLP with separate visual and audio encoders, fused for
-    policy and value outputs.
+    Rotary position embeddings (RoPE), Su-style: the rotation table is built
+    once at init and sliced to whatever sequence length actually arrives, so a
+    model built for one SEQ_LEN still runs on a shorter or longer window
+    without re-allocating cache or crashing.
+    """
+
+    def __init__(self, head_dim: int, max_seq_len: int, base: float = 10000.0):
+        super().__init__()
+        if head_dim % 2 != 0:
+            raise ValueError("RoPE needs an even attention head_dim")
+        self.head_dim = int(head_dim)
+        self.max_seq_len = int(max_seq_len)
+        inv = 1.0 / (base ** (torch.arange(0, head_dim, 2).float() / head_dim))
+        t = torch.arange(self.max_seq_len).float()
+        freqs = torch.outer(t, inv)               # (max_seq_len, head_dim // 2)
+        emb = torch.cat((freqs, freqs), dim=-1)   # (max_seq_len, head_dim)
+        self.register_buffer("cos_cached", emb.cos(), persistent=False)
+        self.register_buffer("sin_cached", emb.sin(), persistent=False)
+
+    def forward(self, q, k):
+        """q, k: (B, H, T, head_dim). Returns the rotated pair."""
+        t = q.shape[-2]
+        if t > self.cos_cached.shape[0]:
+            # Grow the table rather than dying: a longer window than the one
+            # this model was built for is a supported (if slower) case.
+            self._extend(t)
+        cos = self.cos_cached[:t].to(dtype=q.dtype, device=q.device)
+        sin = self.sin_cached[:t].to(dtype=q.dtype, device=q.device)
+        cos = cos.unsqueeze(0).unsqueeze(0)
+        sin = sin.unsqueeze(0).unsqueeze(0)
+        return (q * cos) + (_rotate_half(q) * sin), (k * cos) + (_rotate_half(k) * sin)
+
+    @torch.no_grad()
+    def _extend(self, t: int):
+        base = getattr(self, "_rope_base", 10000.0)
+        inv = 1.0 / (base ** (torch.arange(
+            0, self.head_dim, 2, device=self.cos_cached.device).float() / self.head_dim))
+        freqs = torch.outer(
+            torch.arange(t, device=self.cos_cached.device).float(), inv)
+        emb = torch.cat((freqs, freqs), dim=-1)
+        self.cos_cached = emb.cos()
+        self.sin_cached = emb.sin()
+        self.max_seq_len = int(t)
+
+
+class CausalSelfAttention(nn.Module):
+    """
+    Multi-head causal self-attention with RoPE.
+
+    Attention is computed in float32 even when the model runs in half
+    precision: the softmax over a long window is where fp16 quietly turns into
+    NaNs, and that is exactly the failure that makes a run look stalled.
+    """
+
+    def __init__(self, d_model: int, num_heads: int, dropout: float = 0.0):
+        super().__init__()
+        if d_model % num_heads != 0:
+            raise ValueError(
+                f"d_model {d_model} is not divisible by num_heads {num_heads}")
+        self.d_model = int(d_model)
+        self.num_heads = int(num_heads)
+        self.head_dim = self.d_model // self.num_heads
+        self.scale = self.head_dim ** -0.5
+        self.qkv = nn.Linear(d_model, 3 * d_model, bias=False)
+        self.out_proj = nn.Linear(d_model, d_model, bias=False)
+        self.dropout = float(dropout)
+
+    def forward(self, x, cos_sin=None):
+        B, T, _ = x.shape
+        qkv = self.qkv(x)
+        q, k, v = qkv.chunk(3, dim=-1)
+        # (B, T, H, D) -> (B, H, T, D)
+        q = q.view(B, T, self.num_heads, self.head_dim).transpose(1, 2)
+        k = k.view(B, T, self.num_heads, self.head_dim).transpose(1, 2)
+        v = v.view(B, T, self.num_heads, self.head_dim).transpose(1, 2)
+
+        if cos_sin is not None:
+            rope = cos_sin
+            q, k = rope(q, k)
+
+        # Causal mask: token t may only look at tokens <= t. Built on the fly
+        # so it never needs to be stored in a checkpoint.
+        att = (q @ k.transpose(-2, -1)) * self.scale
+        mask = torch.ones(T, T, dtype=torch.bool, device=x.device).tril()
+        att = att.masked_fill(~mask, float("-inf"))
+        att = torch.softmax(att.float(), dim=-1).to(v.dtype)
+        if self.dropout > 0.0 and self.training:
+            att = F.dropout(att, p=self.dropout)
+        out = att @ v
+        out = out.transpose(1, 2).contiguous().view(B, T, self.d_model)
+        return self.out_proj(out)
+
+
+class SwiGLU(nn.Module):
+    """
+    SwiGLU feed-forward network:
+        SwiGLU(x) = W_down( SiLU(W_gate x) * (W_up x) )
+
+    `hidden` defaults to the 2/3 * 4 * d_model width that keeps the parameter
+    count level with a classic 4x MLP, rounded up to a multiple of 8. That is
+    strictly more expressive than two plain linears for the same budget.
+    """
+
+    def __init__(self, d_model: int, hidden: Optional[int] = None,
+                 dropout: float = 0.0):
+        super().__init__()
+        if hidden is None:
+            hidden = int(round(2.0 / 3.0 * 4.0 * d_model))
+            hidden = max(8, ((hidden + 7) // 8) * 8)
+        self.hidden = int(hidden)
+        self.gate_up = nn.Linear(d_model, 2 * self.hidden, bias=False)
+        self.down = nn.Linear(self.hidden, d_model, bias=False)
+        self.dropout = float(dropout)
+
+    def forward(self, x):
+        gate, up = self.gate_up(x).chunk(2, dim=-1)
+        x = F.silu(gate) * up
+        x = self.down(x)
+        if self.dropout > 0.0 and self.training:
+            x = F.dropout(x, p=self.dropout)
+        return x
+
+
+class TransformerBlock(nn.Module):
+    """Pre-norm transformer block: RMSNorm -> attention -> RMSNorm -> SwiGLU."""
+
+    def __init__(self, d_model: int, num_heads: int, ffn_hidden: Optional[int] = None,
+                 dropout: float = 0.0, norm_eps: float = 1e-6):
+        super().__init__()
+        self.norm1 = RMSNorm(d_model, eps=norm_eps)
+        self.attn = CausalSelfAttention(d_model, num_heads, dropout=dropout)
+        self.norm2 = RMSNorm(d_model, eps=norm_eps)
+        self.ffn = SwiGLU(d_model, hidden=ffn_hidden, dropout=dropout)
+
+    def forward(self, x, cos_sin=None):
+        x = x + self.attn(self.norm1(x), cos_sin=cos_sin)
+        x = x + self.ffn(self.norm2(x))
+        return x
+
+
+class MultiHeadSwiGLUTransformer(nn.Module):
+    """
+    SwiGLU + RoPE transformer with separate visual and audio encoders, fused
+    for policy and value outputs.
+
+    Shape contract (unchanged from the gMLP it replaces, so the environment,
+    the human-imitation path and the rollout buffers all keep working):
+        visual_seq: (B, T, 3, frame_size, frame_size)
+        audio_seq:  (B, T, samples)
+        -> logits (B, num_actions), value (B,)
     """
 
     def __init__(
         self,
-        visual_dim: int = 256,
-        audio_dim: int = 128,
-        hidden_dim: int = 256,
-        num_blocks: int = 4,
-        seq_len: int = 8,
+        visual_dim: int = 128,
+        audio_dim: int = 64,
+        hidden_dim: int = 128,
+        num_blocks: int = 2,
+        seq_len: int = 16,
         num_actions: int = 16,
-        frame_size: int = 84,
+        frame_size: int = 96,
+        num_heads: int = 4,
+        ffn_hidden: Optional[int] = None,
+        dropout: float = 0.0,
+        rope_base: float = 10000.0,
+        norm_eps: float = 1e-6,
+        pool: str = "last",
+        visual_pool: int = 3,
+        audio_downsample: int = 8,
     ):
         super().__init__()
         self.frame_size = int(frame_size)
+        self.seq_len = int(seq_len)
+        self.pool = str(pool).lower()
+        self.arch = ARCH_NAME
+        self.audio_downsample = max(1, int(audio_downsample))
 
         # The three conv stages below consume 8+4+3 pixels of support, so tiny
         # frames produce a negative padded size. Reject that up front with a
@@ -4069,45 +4325,70 @@ class MultiHeadgMLP(nn.Module):
         if self.frame_size < 40:
             raise ValueError(
                 f"IMG_SIZE {self.frame_size} is too small for this encoder; "
-                f"use 40 or larger (160 is the default)"
+                f"use 40 or larger (96 is the default)"
             )
+        if visual_dim % num_heads != 0:
+            raise ValueError(
+                f"visual_dim {visual_dim} is not divisible by num_heads {num_heads}")
 
-        # Visual encoder (small CNN). The adaptive pool keeps the flattened
-        # size constant, so IMG_SIZE can change without breaking the heads.
+        # ---- visual encoder: one CNN token per frame ------------------------
+        # The adaptive pool keeps the flattened size constant, so IMG_SIZE can
+        # change without breaking the heads or forcing new weights.
         self.visual_cnn = nn.Sequential(
             nn.Conv2d(3, 32, kernel_size=8, stride=4), nn.ReLU(),
             nn.Conv2d(32, 64, kernel_size=4, stride=2), nn.ReLU(),
             nn.Conv2d(64, 64, kernel_size=3, stride=1), nn.ReLU(),
-            nn.AdaptiveAvgPool2d((5, 5)),
+            nn.AdaptiveAvgPool2d((visual_pool, visual_pool)),
             nn.Flatten(),
+            nn.Linear(64 * visual_pool * visual_pool, visual_dim),
         )
-        with torch.no_grad():
-            cnn_out = self.visual_cnn(
-                torch.zeros(1, 3, self.frame_size, self.frame_size)
-            ).shape[1]
-        self.visual_proj = nn.Linear(cnn_out, visual_dim)
 
-        # Audio encoder (1D conv over raw waveform)
+        # ---- audio encoder: one 1D-conv token per audio chunk ---------------
+        # `audio_downsample` average-pools the raw waveform before any
+        # convolution. This is the single biggest CPU win in the model: a 16 kHz
+        # chunk run through paired 3x3 convs costs about as much as a whole
+        # 96x96 visual frame, and the fine detail being discarded is well below
+        # what a game's mix actually carries. It runs inside forward() rather
+        # than in the environment so old checkpoints and the human-imitation
+        # path keep feeding raw audio.
         self.audio_cnn = nn.Sequential(
             nn.Conv1d(1, 32, kernel_size=15, stride=4), nn.ReLU(),
             nn.Conv1d(32, 64, kernel_size=9, stride=4), nn.ReLU(),
-            nn.Conv1d(64, 64, kernel_size=5, stride=2), nn.ReLU(),
+            nn.Conv1d(64, audio_dim, kernel_size=5, stride=2), nn.ReLU(),
             nn.AdaptiveAvgPool1d(1),
             nn.Flatten(),
         )
-        with torch.no_grad():
-            audio_out = self.audio_cnn(torch.zeros(1, 1, 16000)).shape[1]
-        self.audio_proj = nn.Linear(audio_out, audio_dim)
 
-        # gMLP heads
-        self.visual_gmlp = nn.Sequential(
-            *[gMLPBlock(visual_dim, visual_dim * 2, seq_len) for _ in range(num_blocks)]
+        # ---- transformer trunks ---------------------------------------------
+        # Visual heads must divide visual_dim; the audio width is chosen as the
+        # largest head count that divides audio_dim, capped to keep attention
+        # cheap.
+        audio_heads = max(
+            (h for h in range(min(4, audio_dim), 0, -1) if audio_dim % h == 0),
+            default=1,
         )
-        self.audio_gmlp = nn.Sequential(
-            *[gMLPBlock(audio_dim, audio_dim * 2, seq_len) for _ in range(num_blocks)]
-        )
+        self.visual_blocks = nn.ModuleList([
+            TransformerBlock(visual_dim, num_heads, ffn_hidden=ffn_hidden,
+                             dropout=dropout, norm_eps=norm_eps)
+            for _ in range(num_blocks)
+        ])
+        self.audio_blocks = nn.ModuleList([
+            TransformerBlock(audio_dim, audio_heads,
+                             ffn_hidden=(ffn_hidden if ffn_hidden and audio_dim == visual_dim
+                                         else None),
+                             dropout=dropout, norm_eps=norm_eps)
+            for _ in range(num_blocks)
+        ])
+        self.visual_norm = RMSNorm(visual_dim, eps=norm_eps)
+        self.audio_norm = RMSNorm(audio_dim, eps=norm_eps)
+        self.visual_rope = RotaryEmbedding(visual_dim // num_heads,
+                                           max(self.seq_len, 2), base=rope_base)
+        self.visual_rope._rope_base = float(rope_base)
+        self.audio_rope = RotaryEmbedding(audio_dim // audio_heads,
+                                          max(self.seq_len, 2), base=rope_base)
+        self.audio_rope._rope_base = float(rope_base)
 
-        # Fusion
+        # ---- fusion + heads -------------------------------------------------
         self.fusion = nn.Sequential(
             nn.Linear(visual_dim + audio_dim, hidden_dim), nn.ReLU(),
             nn.Linear(hidden_dim, hidden_dim), nn.ReLU(),
@@ -4115,19 +4396,75 @@ class MultiHeadgMLP(nn.Module):
         self.policy_head = nn.Linear(hidden_dim, num_actions)
         self.value_head = nn.Linear(hidden_dim, 1)
 
+        self.apply(self._init_weights)
+        # Put the policy head where PPO needs it: a near-uniform Categorical.
+        # Without this an untrained net can start saturated, and a policy that
+        # is already certain of one action never explores its way out.
+        nn.init.orthogonal_(self.policy_head.weight, gain=0.01)
+        nn.init.zeros_(self.policy_head.bias)
+        nn.init.orthogonal_(self.value_head.weight, gain=1.0)
+        nn.init.zeros_(self.value_head.bias)
+
+    @staticmethod
+    def _init_weights(module):
+        if isinstance(module, nn.Linear):
+            nn.init.orthogonal_(module.weight, gain=1.0)
+            if module.bias is not None:
+                nn.init.zeros_(module.bias)
+        elif isinstance(module, nn.Conv1d) or isinstance(module, nn.Conv2d):
+            nn.init.kaiming_normal_(module.weight, nonlinearity="relu")
+            if module.bias is not None:
+                nn.init.zeros_(module.bias)
+
+    def _pool(self, x):
+        """(B, T, D) -> (B, D). Causal, so 'last' is the summary token."""
+        if self.pool == "mean":
+            return x.mean(dim=1)
+        if self.pool == "max":
+            return x.max(dim=1).values
+        return x[:, -1, :]
+
+    def _downsample_audio(self, audio_seq):
+        """
+        (B, T, samples) -> (B, T, samples // audio_downsample).
+
+        Average-pooling the raw waveform is what makes the audio branch cheap;
+        uses a reshape rather than a conv so it costs no parameters and stays
+        fast on a CPU. A tail shorter than one window is dropped.
+        """
+        f = self.audio_downsample
+        if f <= 1:
+            return audio_seq
+        samples = audio_seq.shape[-1]
+        usable = (samples // f) * f
+        if usable <= 0:
+            return audio_seq
+        trimmed = audio_seq[..., :usable]
+        return trimmed.reshape(*trimmed.shape[:-1], usable // f, f).mean(dim=-1)
+
     def forward(self, visual_seq, audio_seq):
         B, T = visual_seq.shape[0], visual_seq.shape[1]
 
-        vis_feat = self.visual_proj(
-            self.visual_cnn(visual_seq.view(B * T, 3, self.frame_size, self.frame_size))
-        )
-        vis_feat = self.visual_gmlp(vis_feat.view(B, T, -1))[:, -1, :]
+        vis = self.visual_cnn(
+            visual_seq.reshape(B * T, 3, self.frame_size, self.frame_size)
+        ).view(B, T, -1)
+        for block in self.visual_blocks:
+            vis = block(vis, cos_sin=self.visual_rope)
+        vis_feat = self._pool(self.visual_norm(vis))
 
-        aud_feat = self.audio_proj(self.audio_cnn(audio_seq.view(B * T, 1, -1)))
-        aud_feat = self.audio_gmlp(aud_feat.view(B, T, -1))[:, -1, :]
+        aud = self._downsample_audio(audio_seq).reshape(B * T, 1, -1)
+        aud = self.audio_cnn(aud).view(B, T, -1)
+        for block in self.audio_blocks:
+            aud = block(aud, cos_sin=self.audio_rope)
+        aud_feat = self._pool(self.audio_norm(aud))
 
         fused = self.fusion(torch.cat([vis_feat, aud_feat], dim=-1))
         return self.policy_head(fused), self.value_head(fused).squeeze(-1)
+
+
+# Kept as an alias so any external script that imported the old name still
+# resolves to the current architecture.
+MultiHeadgMLP = MultiHeadSwiGLUTransformer
 
 
 # =============================================================================
@@ -5175,32 +5512,112 @@ class BackgroundGameEnv(gym.Env):
 # =============================================================================
 
 # Single source of truth for the model shape, so checkpoints can be rebuilt
-# exactly as they were saved.
+# exactly as they were saved. `seq_len`, `num_actions` and `frame_size` are not
+# listed: they come from the live environment and are recorded into the
+# checkpoint at save time. Keeping a second copy here is how the old build
+# ended up building a seq_len=8 model for a seq_len=128 observation and dying
+# on the first forward pass.
 MODEL_CONFIG = {
-    "visual_dim": 256,
-    "audio_dim": 128,
-    "hidden_dim": 256,
-    "num_blocks": 4,
-    "seq_len": 8,
-    "num_actions": 16,
-    "frame_size": 84,
+    "visual_dim": VISUAL_DIM,
+    "audio_dim": AUDIO_DIM,
+    "hidden_dim": HIDDEN_DIM,
+    "num_blocks": NUM_BLOCKS,
+    "num_heads": NUM_HEADS,
+    "ffn_hidden": FFN_HIDDEN,
+    "dropout": DROPOUT,
+    "pool": SEQ_POOL,
+    "audio_downsample": AUDIO_DOWNSAMPLE,
 }
 
+# Bumped whenever the model architecture changes in a way that makes old
+# weights unusable. Checkpoints record it, and load_checkpoint refuses anything
+# that does not match rather than half-loading it.
+ARCH_NAME = "swiglu-rope-transformer-v1"
 
-def build_model(seq_len: int = 8, num_actions: int = 16,
-                frame_size: int = 84,
-                device: Optional[torch.device] = None) -> MultiHeadgMLP:
+
+def describe_model_shape(seq_len: int, num_actions: int, frame_size: int,
+                         cfg: Optional[dict] = None) -> str:
+    """One readable line describing what is about to be trained."""
+    c = dict(cfg or MODEL_CONFIG)
+    algo = "SwiGLU FFN"
+    return (f"{c.get('num_blocks')}x transformer blocks "
+            f"(d_model {c.get('visual_dim')}, {c.get('num_heads')} heads, "
+            f"{algo}, RoPE, {c.get('pool')} pool) over "
+            f"{seq_len} frames at {frame_size}px, {num_actions} actions")
+
+
+def build_model(seq_len: int = SEQ_LEN, num_actions: int = 16,
+                frame_size: int = IMG_SIZE,
+                device: Optional[torch.device] = None,
+                **overrides) -> MultiHeadSwiGLUTransformer:
     cfg = dict(MODEL_CONFIG)
+    cfg.update(overrides)
     cfg.update(seq_len=seq_len, num_actions=num_actions, frame_size=frame_size)
-    model = MultiHeadgMLP(**cfg)
+    model = MultiHeadSwiGLUTransformer(**cfg)
     return model.to(device) if device is not None else model
+
+
+def count_parameters(model: nn.Module) -> int:
+    return sum(p.numel() for p in model.parameters())
+
+
+def lr_scale_for_update(update_index: int) -> float:
+    """
+    Warmup then cosine decay, as a multiplier on the optimizer's base LR.
+
+    Prodigy (and Adam) both benefit from this: a raw constant LR either moves
+    too fast at the start, when the value function is still random and the
+    advantages are mostly noise, or never settles at the end, when the novelty
+    bonus has been mined out and the policy should be consolidating. The decay
+    is what turns "it is technically still training" into "it is converging".
+    """
+    i = max(0, int(update_index))
+    warmup = max(1, int(LR_WARMUP_UPDATES))
+    if i < warmup:
+        return float(i + 1) / float(warmup)
+    total = max(warmup + 1, int(LR_DECAY_UPDATES))
+    progress = min(1.0, float(i - warmup) / float(max(1, total - warmup)))
+    cosine = 0.5 * (1.0 + np.cos(np.pi * progress))
+    lo = float(LR_MIN_FRACTION)
+    return lo + (1.0 - lo) * cosine
+
+
+def build_optimizer(params, kind: str = OPTIMIZER_KIND, lr: float = OPTIMIZER_LR):
+    """
+    Central constructor so training and checkpoint-resume can never disagree
+    about which optimizer a run uses.
+
+    Prodigy is kept available because it needs no learning rate at all, but for
+    a long CPU run Adam plus the warmup/cosine schedule below is the more
+    predictable choice: Prodigy estimates its own step size, which means a
+    decay schedule applied on top of it is fighting the estimator.
+    """
+    kind = str(kind or "adam").strip().lower()
+    if kind == "prodigy":
+        if Prodigy is None:
+            raise RuntimeError("prodigyopt is not installed (pip install prodigyopt)")
+        return Prodigy(params, lr=float(lr))
+    return torch.optim.Adam(params, lr=float(lr), eps=1e-5)
+
+
+def set_optimizer_lr(optimizer, base_lrs: List[float], scale: float) -> float:
+    """Apply `scale` to every stored base LR; returns the first resulting LR."""
+    first = 0.0
+    for idx, group in enumerate(optimizer.param_groups):
+        base = base_lrs[idx] if idx < len(base_lrs) else group.get("lr", 1.0)
+        group["lr"] = float(base) * float(scale)
+        if idx == 0:
+            first = group["lr"]
+    return first
+
 
 
 def report_training_status(step: int, loss: float, alpha: float,
                            entropy: float, target_entropy: float,
                            action_counts: np.ndarray, reward_sums: Dict[str, float],
                            engaged_steps: int, window_steps: int,
-                           env: BackgroundGameEnv) -> None:
+                           env: BackgroundGameEnv,
+                           perf_line: str = "") -> None:
     """
     One status block every few hundred steps, reporting the two things that
     actually answer "is it doing anything?": how often it pressed something,
@@ -5210,10 +5627,15 @@ def report_training_status(step: int, loss: float, alpha: float,
     the engaged share falls, one label owns the histogram, and the reward
     breakdown is nothing but idle cost. Without this you only find out by
     watching the game, which is exactly how a run can waste hours.
+
+    `perf_line` adds the throughput split, which is what tells you whether the
+    machine is keeping up or whether the model needs to get smaller.
     """
     print(f"[Step {step}] loss={loss:.4f} "
           f"entropy={entropy:.3f}/{target_entropy:.3f} alpha={alpha:.4f} "
           f"rnd_mean={env.intrinsic.rnd_mean:.4f}")
+    if perf_line:
+        print(f"          {perf_line}")
     total = int(action_counts.sum())
     if total <= 0 or window_steps <= 0:
         return
@@ -5255,14 +5677,17 @@ def train_ppo(
     keep_checkpoints: int = CHECKPOINT_KEEP,
     checkpoint_dir: str = CHECKPOINT_DIR,
     enable_hotkeys: bool = True,
-    final_model_path: str = "background_gmlp_model.pt",
-    initial_model: Optional[MultiHeadgMLP] = None,
+    final_model_path: str = "background_swiglu_model.pt",
+    initial_model: Optional[MultiHeadSwiGLUTransformer] = None,
     initial_optimizer=None,
     initial_step: int = 0,
     control: Optional[SignalController] = None,
     entropy_coef: float = ENTROPY_COEF,
     human: Optional[HumanWatcher] = None,
-) -> MultiHeadgMLP:
+    minibatch_size: int = MINIBATCH_SIZE,
+    epochs_per_update: int = EPOCHS_PER_UPDATE,
+    update_seconds_budget: float = UPDATE_SECONDS_BUDGET,
+) -> MultiHeadSwiGLUTransformer:
     """
     PPO training loop with three escape hatches:
 
@@ -5289,6 +5714,16 @@ def train_ppo(
     exploring, and the periodic status line reports the action histogram and
     the reward breakdown, so a policy that has quietly learned to press nothing
     is visible in the log instead of only in the game.
+
+    Two things here exist specifically so a slow machine never looks dead:
+
+      * Each PPO epoch runs in `minibatch_size` chunks instead of one giant
+        tensor, which keeps every backward pass small and cache-friendly.
+      * `update_seconds_budget` caps the total time an update may spend
+        looping. If it is hit, the update ends early and the loop goes back to
+        collecting experience. Progress is therefore bounded per update, so
+        the run always advances and always reaches its next checkpoint/status
+        line.
     """
     total_steps = resolve_steps(total_steps)
     device = env.device
@@ -5309,10 +5744,27 @@ def train_ppo(
     if initial_optimizer is not None:
         optimizer = initial_optimizer
     else:
-        optimizer = Prodigy(model.parameters(), lr=1.0)
+        optimizer = build_optimizer(model.parameters())
+    # The base LR of each param group, captured before any schedule touches it,
+    # so warmup/decay is always applied to the true base instead of compounding.
+    base_lrs = [float(g.get("lr", 1.0)) for g in optimizer.param_groups]
 
     gamma, lam, clip_eps = 0.99, 0.95, 0.2
-    epochs_per_update = 4
+    epochs_per_update = max(1, int(epochs_per_update))
+    minibatch_size = max(1, int(minibatch_size))
+    update_seconds_budget = float(update_seconds_budget)
+    update_index = 0
+    print(f"[Training] Model: {count_parameters(model):,} parameters - "
+          f"{describe_model_shape(env.seq_len, env.action_space.n, env.frame_size)}")
+    print(f"[Training] PPO: {batch_size} steps/update x {epochs_per_update} epoch(s) "
+          f"in minibatches of <= {minibatch_size}"
+          + (f", {update_seconds_budget:.0f}s budget per update"
+             if update_seconds_budget > 0 else ", no update time budget")
+          + f"; LR warmup {LR_WARMUP_UPDATES} then cosine decay to "
+            f"{LR_MIN_FRACTION:.0%} over {LR_DECAY_UPDATES} updates.")
+    opt_name = type(optimizer).__name__
+    opt_lr = ", ".join(f"{g.get('lr', 0.0):.2e}" for g in optimizer.param_groups)
+    print(f"[Training] Optimizer: {opt_name} (base lr {opt_lr})")
 
     # Exploration pressure. `alpha` is the live entropy coefficient; it starts
     # at ENTROPY_COEF and is nudged up while the policy's entropy sits below
@@ -5330,6 +5782,20 @@ def train_ppo(
     rollout = {k: [] for k in
                ["visual", "audio", "actions", "log_probs",
                 "rewards", "values", "dones", "dones_any"]}
+
+    # Rolling wall-clock diagnostics. `env` prints its own per-step cost; these
+    # cover the *update* side, which is the half that silently eats a run on a
+    # CPU. step_times holds recent seconds-per-environment-step, update_times
+    # recent seconds-per-PPO-update, and env_share the fraction of wall clock
+    # spent actually interacting with the game (the number that matters: if it
+    # collapses, the model is too big for this machine).
+    step_times: deque = deque(maxlen=200)
+    update_times: deque = deque(maxlen=50)
+    total_step_seconds = 0.0
+    total_update_seconds = 0.0
+    last_step_start = time.time()
+    last_update_report = 0.0
+    minibatches_skipped_by_budget = 0
 
     # Windowed diagnostics, reset every time the status line is printed.
     status_every = 500
@@ -5364,6 +5830,7 @@ def train_ppo(
                 **MODEL_CONFIG, "seq_len": env.seq_len,
                 "num_actions": env.action_space.n,
                 "frame_size": env.frame_size,
+                "arch": ARCH_NAME,
                 "keymap": {
                     "path": env.keymap.path,
                     "origin": env.keymap.origin,
@@ -5474,6 +5941,13 @@ def train_ppo(
                 next_obs, reward, terminated, truncated, info = env.step(action.item())
                 episode_done = bool(terminated or truncated)
 
+                # Wall-clock split between "interacting with the game" and
+                # "training on what we saw". See the [Perf] report below.
+                now = time.time()
+                step_times.append(now - last_step_start)
+                total_step_seconds += now - last_step_start
+                last_step_start = now
+
                 rollout["visual"].append(obs["visual"])
                 rollout["audio"].append(obs["audio"])
                 rollout["actions"].append(action.item())
@@ -5558,25 +6032,79 @@ def train_ppo(
             adv_t = torch.tensor(adv, dtype=torch.float32).to(device)
             ret_t = torch.tensor(returns, dtype=torch.float32).to(device)
 
-            for _ in range(epochs_per_update):
-                logits, vpred = model(vis_t, aud_t)
-                dist = torch.distributions.Categorical(logits=logits)
-                new_logp = dist.log_prob(act_t)
+            n_samples = int(vis_t.shape[0])
+            mb_size = max(1, min(minibatch_size, n_samples))
 
-                ratio = torch.exp(new_logp - old_logp)
-                surr1 = ratio * adv_t
-                surr2 = torch.clamp(ratio, 1 - clip_eps, 1 + clip_eps) * adv_t
-                policy_loss = -torch.min(surr1, surr2).mean()
-                value_loss = F.mse_loss(vpred, ret_t)
-                entropy = dist.entropy().mean()
-                loss = policy_loss + 0.5 * value_loss - alpha * entropy
+            # Learning-rate schedule (warmup, then cosine decay). Set before the
+            # first minibatch of this update so the LR is never left at whatever
+            # the previous update happened to end on.
+            lr_now = set_optimizer_lr(optimizer, base_lrs, lr_scale_for_update(update_index))
 
-                optimizer.zero_grad()
-                loss.backward()
-                torch.nn.utils.clip_grad_norm_(model.parameters(), 0.5)
-                optimizer.step()
-                last_loss = loss.item()
-                last_entropy = float(entropy.item())
+            update_started = time.time()
+            epochs_done = 0
+            minibatches_done = 0
+            budget_hit = False
+
+            for _epoch in range(epochs_per_update):
+                # Shuffle once per epoch so minibatches differ between passes.
+                perm = torch.randperm(n_samples, device=device)
+                stop_epoch = False
+                for start in range(0, n_samples, mb_size):
+                    idx = perm[start:start + mb_size]
+                    if idx.numel() == 0:
+                        continue
+
+                    logits, vpred = model(vis_t[idx], aud_t[idx])
+                    dist = torch.distributions.Categorical(logits=logits)
+                    new_logp = dist.log_prob(act_t[idx])
+
+                    ratio = torch.exp(new_logp - old_logp[idx])
+                    surr1 = ratio * adv_t[idx]
+                    surr2 = torch.clamp(ratio, 1 - clip_eps, 1 + clip_eps) * adv_t[idx]
+                    policy_loss = -torch.min(surr1, surr2).mean()
+                    value_loss = F.mse_loss(vpred, ret_t[idx])
+                    entropy = dist.entropy().mean()
+                    loss = policy_loss + 0.5 * value_loss - alpha * entropy
+
+                    optimizer.zero_grad(set_to_none=True)
+                    loss.backward()
+                    grad_norm = torch.nn.utils.clip_grad_norm_(
+                        model.parameters(), GRAD_CLIP_NORM)
+                    optimizer.step()
+                    minibatches_done += 1
+
+                    # A non-finite loss poisons every weight on the next step,
+                    # so catch it here, on the minibatch that produced it, and
+                    # stop the update instead of writing NaNs into the model.
+                    if not torch.isfinite(loss) or not torch.isfinite(grad_norm):
+                        print(f"[Training] WARNING: non-finite "
+                              f"{'loss' if not torch.isfinite(loss) else 'gradient'} "
+                              f"at step {step}; ending this update early.")
+                        budget_hit = True
+                        stop_epoch = True
+                        break
+
+                    last_loss = float(loss.item())
+                    last_entropy = float(entropy.item())
+
+                    # The anti-stall guarantee: no single update may run longer
+                    # than the budget. Experience collection resumes immediately
+                    # and the next update picks up from a fresher policy.
+                    if (update_seconds_budget > 0
+                            and time.time() - update_started >= update_seconds_budget):
+                        budget_hit = True
+                        stop_epoch = True
+                        break
+                if stop_epoch:
+                    break
+                epochs_done += 1
+
+            update_seconds = time.time() - update_started
+            update_times.append(update_seconds)
+            total_update_seconds += update_seconds
+            update_index += 1
+            if budget_hit:
+                minibatches_skipped_by_budget += 1
 
             # Keep the entropy bonus honest: if the policy has stopped
             # exploring, buy exploration back rather than letting the run sit
@@ -5610,11 +6138,35 @@ def train_ppo(
 
             if step >= next_status:
                 next_status = step + status_every
+                sec_per_step = (sum(step_times) / len(step_times)) if step_times else 0.0
+                sec_per_update = (sum(update_times) / len(update_times)) if update_times else 0.0
+                wall = total_step_seconds + total_update_seconds
+                env_share = (100.0 * total_step_seconds / wall) if wall > 0 else 100.0
+                budget_note = (f", {minibatches_skipped_by_budget} update(s) hit the "
+                               f"{update_seconds_budget:.0f}s budget"
+                               if minibatches_skipped_by_budget else "")
+                perf_line = (f"perf: {1.0 / sec_per_step:.1f} env steps/s "
+                             f"({sec_per_step * 1000:.0f} ms/step), "
+                             f"{sec_per_update:.1f} s/PPO update, "
+                             f"{env_share:.0f}% of wall clock in the game"
+                             f"{budget_note}")
                 report_training_status(
                     step, last_loss, alpha, last_entropy, target_entropy,
                     action_counts, reward_sums, engaged_steps, window_steps,
                     env,
+                    perf_line=perf_line,
                 )
+                if env_share < 50.0:
+                    print("          [WARN] most of the wall clock is going into "
+                          "PPO updates, so the bot is reacting to stale frames. "
+                          "Lower SEQ_LEN first (it is the dominant cost), then "
+                          "IMG_SIZE, or raise MINIBATCH_SIZE "
+                          "for better cache use (SECTION 0).")
+                if sec_per_update > max(5.0, update_seconds_budget or 0.0):
+                    print("          [WARN] updates are slow for this machine. "
+                          "SEQ_LEN and the audio downsampling factor are the "
+                          "biggest levers; IMG_SIZE matters much less than it "
+                          "looks (SECTION 0).")
                 action_counts[:] = 0
                 reward_sums.clear()
                 engaged_steps = 0
@@ -5708,6 +6260,20 @@ def load_checkpoint(path: str, device: torch.device,
     cfg = dict(ckpt.get("model_config") or MODEL_CONFIG)
     cfg.pop("keymap", None)          # metadata, not a model argument
 
+    # Architecture gate. Checkpoints written before the SwiGLU/RoPE rebuild
+    # have no "arch" key at all, and one of those must never be partially
+    # loaded into the new model - the state_dict errors that produces are
+    # unreadable, and a half-loaded model trains on garbage.
+    saved_arch = cfg.pop("arch", None)
+    if saved_arch != ARCH_NAME:
+        print(f"[Resume] '{os.path.basename(path)}' was trained by an older "
+              f"model ({saved_arch or 'pre-SwiGLU gMLP build'}); this build "
+              f"trains {ARCH_NAME}.")
+        print("[Resume] Weights cannot be reused across architectures, so this "
+              "run starts fresh. Delete the checkpoint directory to stop being "
+              "reminded.")
+        return None
+
     if expect_actions is not None:
         saved_actions = int(cfg.get("num_actions") or MODEL_CONFIG["num_actions"])
         if saved_actions != expect_actions:
@@ -5726,13 +6292,13 @@ def load_checkpoint(path: str, device: torch.device,
             return None
 
     try:
-        model = MultiHeadgMLP(**cfg).to(device)
+        model = MultiHeadSwiGLUTransformer(**cfg).to(device)
         model.load_state_dict(ckpt["model_state_dict"])
     except Exception as exc:
         print(f"[Resume] Model mismatch in '{path}': {exc}")
         return None
 
-    optimizer = Prodigy(model.parameters(), lr=1.0)
+    optimizer = build_optimizer(model.parameters())
     try:
         if "optimizer_state_dict" in ckpt:
             optimizer.load_state_dict(ckpt["optimizer_state_dict"])
@@ -5838,9 +6404,9 @@ def build_parser() -> argparse.ArgumentParser:
         prog="bot1.py",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         description=(
-            "Train a gMLP agent to play a windowed game from game-agnostic\n"
-            "intrinsic rewards, and let it watch you whenever you take the\n"
-            "controls back.\n\n"
+            "Train a SwiGLU + RoPE transformer agent to play a windowed game\n"
+            "from game-agnostic intrinsic rewards, and let it watch you\n"
+            "whenever you take the controls back.\n\n"
             "  python bot1.py              train (and hand the controls to you\n"
             "                              whenever you touch the keyboard or\n"
             "                              mouse, then take them back 3s later)\n"
@@ -6425,7 +6991,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             keep_checkpoints=args.keep_checkpoints,
             checkpoint_dir=args.checkpoint_dir,
             enable_hotkeys=not args.no_hotkeys,
-            final_model_path="background_gmlp_model.pt",
+            final_model_path="background_swiglu_model.pt",
             initial_model=loaded["model"] if loaded else None,
             initial_optimizer=loaded["optimizer"] if loaded else None,
             initial_step=initial_step,

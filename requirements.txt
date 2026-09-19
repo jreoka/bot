@@ -1,0 +1,7 @@
+torch
+numpy
+prodigyopt
+opencv-python
+gymnasium
+pywin32==312; sys_platform == "win32"
+soundcard
