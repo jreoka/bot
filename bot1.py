@@ -231,6 +231,37 @@ INJECTION_AUDIT = False
 # --calibrate measures your own value and stores it in the keymap.
 MOUSE_TURN_PIXELS = 60
 
+# How fast the bot is allowed to turn the view. Each entry is
+# ("name", multiplier) applied to the calibrated per-step turn above, and every
+# entry becomes its own set of turn actions (look_left, look_left_fine, ...), so
+# the policy chooses how far to turn exactly like it chooses which button to
+# press:
+#
+#   * the slow end is what makes detailed movement possible: a small correction
+#     that the calibrated step would overshoot (lining up a shot, stepping onto
+#     one block, centring a doorway);
+#   * the fast end is for spinning around - turning to face something behind you
+#     in one control step instead of ten, which is also the difference between
+#     noticing a threat and being killed by it.
+#
+# The entry closest to 1.0x is the calibrated turn --calibrate measured, and it
+# keeps the plain names (look_left, look_up, ...); the rest get their name as a
+# suffix (look_left_fine). Set this to (("normal", 1.0),) to get the old
+# single-speed behaviour back.
+#
+# Two things to know before editing it:
+#   * multipliers must be positive. A negative one would only duplicate the
+#     opposite direction's actions, so those entries are ignored with a note.
+#   * this changes the action space, so a checkpoint from a run with a different
+#     list is refused and the next launch starts a fresh policy (same as any
+#     other change to the calibrated keymap).
+#
+# A game that turns by the *accelerated* cursor rather than raw mouse input will
+# not scale perfectly linearly, so the fast level may turn more or less than the
+# multiplication suggests. Watch it once (DIAGNOSTIC = "actions" prints the
+# pixel counts) and adjust the multiplier rather than the code.
+MOUSE_TURN_SPEEDS = (("fine", 0.25), ("normal", 1.0), ("fast", 4.0))
+
 # ---- keymap / calibration ---------------------------------------------------
 # The JSON whitelist of keys the bot may press. Written by --calibrate, read by
 # every other run. Delete it to fall back to the built-in defaults.
@@ -1023,6 +1054,74 @@ def _key_priority(name: str) -> int:
     return table.get(str(name).upper(), 50)
 
 
+# ---- mouse-look speed levels (see MOUSE_TURN_SPEEDS in SECTION 0) -----------
+
+def _configured_turn_speeds() -> List[Tuple[str, float]]:
+    """
+    MOUSE_TURN_SPEEDS with the unusable entries filtered out: (name, multiplier).
+
+    A malformed entry or a non-positive multiplier is reported and skipped
+    rather than crashing the run or generating a turn action that cannot turn.
+    Accepts a dict too, for a name -> multiplier spelling.
+    """
+    speeds: List[Tuple[str, float]] = []
+    entries = MOUSE_TURN_SPEEDS
+    if isinstance(entries, dict):
+        entries = list(entries.items())
+    for entry in (entries or ()):
+        try:
+            name, multiplier = entry
+            multiplier = float(multiplier)
+        except (TypeError, ValueError):
+            print(f"[Look] Ignoring the MOUSE_TURN_SPEEDS entry {entry!r}: "
+                  f"expected a (\"name\", multiplier) pair.")
+            continue
+        name = str(name).strip() or f"x{multiplier:g}"
+        if multiplier <= 0.0:
+            print(f"[Look] Ignoring the '{name}' mouse speed: a multiplier of "
+                  f"{multiplier:g} cannot turn the view.")
+            continue
+        speeds.append((name, multiplier))
+    return speeds
+
+
+def mouse_turn_levels(base_turn: int) -> List[Tuple[str, int, bool]]:
+    """
+    The turn sizes the bot may choose between, as (name, pixels, calibrated).
+
+    Each configured MOUSE_TURN_SPEEDS entry is its multiplier applied to the
+    calibrated per-step turn, rounded to a whole pixel (a fractional cursor
+    delta is not a thing) and floored at 1px so even a "fine" level still turns.
+    Levels that round to the same pixel count are collapsed: two turn actions
+    doing exactly the same thing would only split the policy's probability
+    across clones.
+
+    Exactly one level comes back flagged True - the one closest to the
+    calibrated turn - and those are the actions that keep the plain
+    'look_left' names, so an unusual set of multipliers still reads sensibly.
+    """
+    base = max(1, int(base_turn))
+    raw: List[Tuple[str, int, float]] = []
+    seen = set()
+    for name, multiplier in _configured_turn_speeds():
+        pixels = int(round(base * multiplier)) or 1     # never a zero-length turn
+        if pixels in seen:
+            continue
+        seen.add(pixels)
+        raw.append((name, pixels, multiplier))
+    if not raw:
+        # No usable entries at all: fall back to the calibrated turn alone.
+        raw = [("normal", base, 1.0)]
+    calibrated = min(range(len(raw)), key=lambda i: abs(raw[i][2] - 1.0))
+    return [(name, pixels, index == calibrated)
+            for index, (name, pixels, _multiplier) in enumerate(raw)]
+
+
+def look_action_label(direction: str, name: str, calibrated: bool) -> str:
+    """'look_left' for the calibrated speed, 'look_left_fine' for the rest."""
+    return f"look_{direction}" if calibrated else f"look_{direction}_{name}"
+
+
 def _hold_tokens(keymap: Keymap) -> List[str]:
     """
     Hold tokens allowed by the keymap.
@@ -1065,7 +1164,9 @@ def build_action_set(keymap: Optional[Keymap] = None,
         * ``tap``   - a button pressed and released inside the step.
         * ``click`` - a mouse button clicked inside the step.
         * ``look``  - a relative mouse turn, which is the only thing games'
-                      mouse-look responds to.
+                      mouse-look responds to. Generated once per configured
+                      speed (MOUSE_TURN_SPEEDS), so one action can be a fine
+                      aiming correction and another a spin on the spot.
 
     One action covers buttons + a click + a turn at once, so the bot can learn
     combinations like "hold W, jump" or "hold W and D, click" as single
@@ -1135,12 +1236,25 @@ def build_action_set(keymap: Optional[Keymap] = None,
                                 "tap": name, "click": None, "look": None})
 
     # Looking around and clicking, which any first-person game needs.
-    turn = max(4, int(keymap.default_mouse_turn))
-    for label, dx, dy in (("look_left", -turn, 0), ("look_right", turn, 0),
-                          ("look_up", 0, -turn), ("look_down", 0, turn)):
-        add(5, ("look", label), {"label": label, "held": [], "uses": [],
-                                 "tap": None, "click": None,
-                                 "look": [dx, dy]})
+    #
+    # Looking is generated once per configured speed, so "how far do I turn" is
+    # part of the same decision as "which buttons do I hold": a fine step to
+    # line a shot up or centre a doorway, the calibrated step for ordinary
+    # looking, and a large one to spin around and face whatever is behind you.
+    # See MOUSE_TURN_SPEEDS in SECTION 0.
+    levels = mouse_turn_levels(keymap.default_mouse_turn)
+    horizontal = (("left", -1), ("right", 1))
+    for name, turn, calibrated in levels:
+        for direction, sign in horizontal:
+            label = look_action_label(direction, name, calibrated)
+            add(5, ("look", label), {"label": label, "held": [], "uses": [],
+                                     "tap": None, "click": None,
+                                     "look": [sign * turn, 0]})
+        for direction, sign in (("up", -1), ("down", 1)):
+            label = look_action_label(direction, name, calibrated)
+            add(5, ("look", label), {"label": label, "held": [], "uses": [],
+                                     "tap": None, "click": None,
+                                     "look": [0, sign * turn]})
     for button in ("left", "right", "middle"):
         if keymap.mouse_button_name(button):
             add(6, ("click", button), {"label": f"click:{button}", "held": [],
@@ -1148,12 +1262,14 @@ def build_action_set(keymap: Optional[Keymap] = None,
                                        "click": button, "look": None})
     if keymap.mouse_button_name("left"):
         forward = movement[:1]
-        for label, dx, dy in (("look_left", -turn, 0), ("look_right", turn, 0)):
-            add(8, ("hold", tuple(forward), "look", label),
-                {"label": (f"hold:{_hold_label(keymap, forward[0])}+{label}"
-                           if forward else label),
-                 "held": list(forward), "uses": [], "tap": None,
-                 "click": None, "look": [dx, dy]})
+        for name, turn, calibrated in levels:
+            for direction, sign in horizontal:
+                label = look_action_label(direction, name, calibrated)
+                add(8, ("hold", tuple(forward), "look", label),
+                    {"label": (f"hold:{_hold_label(keymap, forward[0])}+{label}"
+                               if forward else label),
+                     "held": list(forward), "uses": [], "tap": None,
+                     "click": None, "look": [sign * turn, 0]})
 
     # Button combinations from your own play, so the policy can reproduce
     # something the defaults never imagined. Each stored button is resolved to
@@ -2101,8 +2217,15 @@ def _print_key_report(keymap: Keymap, allowed: Dict[str, dict]):
         print(f"  mouse look: {sens.get('pixels_per_step', 0.0):.1f} px per "
               f"control step on average "
               f"(max {sens.get('max_pixels_per_step', 0.0):.0f})")
-        print(f"              -> MOUSE_TURN_PIXELS set to "
-              f"{keymap.default_mouse_turn}")
+        print(f"              -> calibrated turn set to "
+              f"{keymap.default_mouse_turn} px")
+    levels = mouse_turn_levels(keymap.default_mouse_turn)
+    print("  mouse speeds: " + ", ".join(
+        f"{name} {pixels}px" + (" (calibrated)" if calibrated else "")
+        for name, pixels, calibrated in levels))
+    if len(levels) == 1:
+        print("              (only one speed: add entries to MOUSE_TURN_SPEEDS "
+              "in SECTION 0 to let the bot aim finely or spin around)")
     print("-" * 72)
 
 
@@ -2432,12 +2555,27 @@ def describe_action(action: dict, keymap: Optional[Keymap] = None) -> str:
 
 
 def _extract_look(dx: float, dy: float, turn: int) -> Optional[List[int]]:
-    """Map a recorded mouse delta onto one of the four look actions."""
+    """
+    Map a recorded mouse delta onto one of the turn actions.
+
+    The direction is whichever axis moved further, and how *far* it moved is
+    matched to the closest configured speed. That is what makes a demonstration
+    of aiming imitate as a small correction instead of being rounded up to the
+    calibrated turn, and a flick as a spin instead of the same small step.
+
+    The returned pair is byte-for-byte one of the pairs build_action_set()
+    generates, because _ButtonLookup matches look tuples exactly.
+    """
     if abs(dx) < 0.5 and abs(dy) < 0.5:
         return None
+    magnitude = max(abs(dx), abs(dy))
+    # Compare multiplicatively: being 2x off is the same miss at 2px and at 80px,
+    # which is what keeps the fine level from swallowing every small twitch.
+    pixels = min((abs(px) for _name, px, _calibrated in mouse_turn_levels(turn)),
+                 key=lambda px: abs(np.log(px / magnitude)))
     if abs(dx) >= abs(dy):
-        return [-turn, 0] if dx < 0 else [turn, 0]
-    return [0, -turn] if dy < 0 else [0, turn]
+        return [-pixels, 0] if dx < 0 else [pixels, 0]
+    return [0, -pixels] if dy < 0 else [0, pixels]
 
 
 def _uses_tokens(keymap: Keymap, uses) -> List[str]:
@@ -2596,7 +2734,9 @@ def build_human_replay(frames: List[np.ndarray],
 
     button_sets = timeline.active_at(times)
     deltas = timeline.move_deltas(times)
-    turn = max(4, int(keymap.default_mouse_turn))
+    # The same helper build_action_set() uses, so a delta extracted here is
+    # exactly one of the turn actions the policy can actually choose.
+    turn = int(keymap.default_mouse_turn)
 
     segment = HumanSegment()
     for i, frame in enumerate(frames):
@@ -5253,6 +5393,11 @@ class BackgroundGameEnv(gym.Env):
         else:
             print(f"[Input] Real keyboard + mouse into the focused window "
                   f"({len(self.actions)} calibrated actions).")
+        levels = mouse_turn_levels(self.keymap.default_mouse_turn)
+        if len(levels) > 1:
+            print("[Input] Mouse-look speeds: " + ", ".join(
+                f"{name} {pixels}px" for name, pixels, _cal in levels)
+                + "  (fine aiming ... spinning around)")
         self._held: set = set()
         self._action_override: Optional[set] = None
         self._tracked_hold: set = set()
@@ -6585,7 +6730,10 @@ def run_diagnostic(args) -> int:
         print(f"Keymap   : {keymap.path or '(built-in defaults)'}")
         print(f"Origin   : {keymap.origin}")
         print(f"Keys     : {keymap.describe_keys()}")
-        print(f"Mouse    : turn {keymap.default_mouse_turn} px per action")
+        print(f"Mouse    : turn {keymap.default_mouse_turn} px per step at "
+              f"1.0x, speeds " + ", ".join(
+                  f"{name}={pixels}px" for name, pixels, _cal
+                  in mouse_turn_levels(keymap.default_mouse_turn)))
         print(f"Actions  : {len(actions)}"
               + (" (capped at MAX_ACTIONS)" if keymap.actions_capped else ""))
         print("-" * 72)
