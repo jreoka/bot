@@ -237,7 +237,13 @@ class Config:
     # what to tap - and the number of simultaneously held keys is capped.
     # =====================================================================
     max_held_keys: int = 4
-    mouse_turn_pixels: int = 20
+    # Override for how many pixels one mouse-turn step is. 0 = use what
+    # --calibrate measured, which is right only when the game lets the cursor
+    # move: a game that locks the cursor (Minecraft, most first-person titles)
+    # reports a still cursor to the recorder, so the measurement comes out at
+    # one or two pixels and the bot cannot turn its view at all. --mouse-turn
+    # sets it directly.
+    mouse_turn_pixels: int = 0
     turn_levels: Tuple[Tuple[str, float], ...] = (
         ("fine", 0.4), ("normal", 1.0), ("fast", 2.5))
     # Virtual keys the recorder refuses to learn and the bot refuses to press.

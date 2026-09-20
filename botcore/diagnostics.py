@@ -19,9 +19,10 @@ from typing import List, Optional
 
 import numpy as np
 
-from .capture import (FrameGrabber, FrameStack, enumerate_windows,
-                      format_window_table, get_process_name, get_window_pid,
-                      looks_like_game, require_windows)
+from .capture import (FrameGrabber, FrameStack, describe_window,
+                      enumerate_windows, format_window_table, get_process_name,
+                      get_window_pid, looks_like_game,
+                      looks_like_non_game_process, require_windows)
 from .config import Config
 from .keys import ActionSpace, InputInjector, Keymap
 
@@ -42,10 +43,12 @@ def list_windows() -> int:
     games = [w for w in windows if looks_like_game(w)]
     if games:
         print(f"  Largest likely game: {games[0]['title']} "
-              f"(hwnd {games[0]['hwnd']})")
+              f"({games[0]['process']}) hwnd={games[0]['hwnd']}")
         print("  That is what the bot picks automatically.")
     else:
         print("  Nothing here looks like a game; the bot will ask you to pick.")
+    print("  Marked windows are never auto-selected: the terminal this bot runs")
+    print("  in, its own console, and programs that are not games.")
     print()
     return 0
 
@@ -145,6 +148,7 @@ def check_capture(cfg: Config, hwnd: int, seconds: float = 5.0) -> int:
 
 def show_actions(cfg: Config, keymap: Keymap) -> int:
     """Print the action space this keymap produces."""
+    keymap.set_mouse_turn(cfg.mouse_turn_pixels)
     space = ActionSpace.build(keymap, max_held=cfg.max_held_keys,
                               turn_levels=cfg.turn_levels)
     print()
@@ -190,6 +194,7 @@ def benchmark(cfg: Config, keymap: Keymap, decisions: int = 120) -> int:
         return 1
     require_windows("Benchmarking")
 
+    keymap.set_mouse_turn(cfg.mouse_turn_pixels)
     space = ActionSpace.build(keymap, max_held=cfg.max_held_keys,
                               turn_levels=cfg.turn_levels)
     try:
@@ -258,9 +263,15 @@ def benchmark(cfg: Config, keymap: Keymap, decisions: int = 120) -> int:
     return 0
 
 
-def preflight(cfg: Config, keymap: Optional[Keymap]) -> List[str]:
+def preflight(cfg: Config, keymap: Optional[Keymap],
+              target: Optional[dict] = None) -> List[str]:
     """
     Return a list of warnings worth printing before a long run starts.
+
+    ``target`` is the window that was just selected, and half of these warnings
+    are about it: driving the wrong window is the one mistake that produces a
+    completely healthy-looking run with nothing happening in the game, so it is
+    worth more than one line of checking.
     """
     warnings: List[str] = []
     import torch
@@ -279,4 +290,30 @@ def preflight(cfg: Config, keymap: Optional[Keymap]) -> List[str]:
     elif not keymap.holds:
         warnings.append("The keymap has no hold keys, so the bot cannot walk "
                         "or hold anything down.")
+    if target is not None:
+        process = str(target.get("process") or "")
+        if looks_like_non_game_process(process):
+            warnings.append(
+                f"The selected window is {describe_window(target)}, which is "
+                f"not a game. Every key the bot presses will go to that "
+                f"program instead of the game. Check --list-windows, then "
+                f"restart with --window HWND.")
+        if keymap is not None and keymap.game_hwnd:
+            if int(target.get("hwnd") or 0) != int(keymap.game_hwnd):
+                warnings.append(
+                    f"--calibrate recorded the game as '{keymap.game}' "
+                    f"(hwnd {keymap.game_hwnd}), but this run selected "
+                    f"{describe_window(target)}. If the recorded handle is "
+                    f"still the game, restart with --window {keymap.game_hwnd}.")
+    if keymap is not None:
+        measured = float((keymap.mouse_sensitivity or {}).get(
+            "median_pixels_per_step") or 0.0)
+        if keymap.default_mouse_turn < 4:
+            warnings.append(
+                f"The mouse turn step is {int(keymap.default_mouse_turn)} "
+                f"pixel(s) (measured median {measured:.1f} px at calibration). "
+                f"A game that locks the cursor hides your real look speed from "
+                f"the recorder, so this is usually far too small for the bot "
+                f"to turn with: set it explicitly with --mouse-turn 20 and "
+                f"watch whether the view turns.")
     return warnings

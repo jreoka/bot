@@ -185,6 +185,8 @@ class GameSession:
         self._status_novel = 0
         self._held_vks: List[int] = []
         self._action_counts: Dict[str, int] = defaultdict(int)
+        self._alerted_no_delivery = False
+        self._alerted_non_game = False
         self._pending_previous_embed = np.zeros(self.cfg.embed_dim,
                                                 dtype=np.float32)
         self._pending_embed = np.zeros(self.cfg.embed_dim, dtype=np.float32)
@@ -374,7 +376,67 @@ class GameSession:
 
         info = {"reward": reward, "reset": reset, "reset_reason": reason,
                 "reward_parts": dict(self.reward.last)}
+        self._check_input_delivery()
         return observation, reward, bool(truncated), info
+
+    # ---- health: is the bot driving anything? ----
+    def _input_stats(self) -> Optional[Dict[str, object]]:
+        """Input/delivery counters from the environment, when it reports them."""
+        getter = getattr(self.env, "input_stats", None)
+        if not callable(getter):
+            return None
+        try:
+            stats = getter()
+        except Exception:
+            return None
+        return stats if isinstance(stats, dict) else None
+
+    def _check_input_delivery(self) -> None:
+        """
+        Say so, once and out loud, when the loop is running but nothing is
+        reaching a window.
+
+        This is the failure behind "it says 20 steps a second but nothing
+        happens": every frame arrives, the policy decides on schedule, the
+        rollout fills, and every keystroke is delivered to some other window -
+        or to none at all. Nothing else in the log distinguishes that from a
+        run that is working, so it is checked directly rather than inferred
+        from the reward going flat.
+        """
+        stats = self._input_stats()
+        if not stats:
+            return
+        if not self._alerted_non_game and stats.get("non_game"):
+            self._alerted_non_game = True
+            self._print(
+                f"[Health] This run is driving '{stats.get('title')}' "
+                f"({stats.get('process')}), which looks like a terminal, "
+                f"browser or editor rather than a game. Input sent there does "
+                f"not reach a game at all. Check the line above that says "
+                f"which window was selected, then restart with --pick or "
+                f"--window HWND (see --list-windows).")
+        if self._alerted_no_delivery:
+            return
+        # Give a fresh run long enough to have pressed something at all: the
+        # first few steps are legitimately idle while the frame stack fills.
+        if self.total_steps < max(50, self.cfg.status_every // 4):
+            return
+        if int(stats.get("delivered") or 0) > 0:
+            return
+        self._alerted_no_delivery = True
+        if stats.get("focused"):
+            detail = ("The window it selected is in front, so the window is "
+                      "not the problem: either the policy has not pressed "
+                      "anything yet, or the game was told to ignore input "
+                      "from an unfocused window (--focus always is the "
+                      "workaround for a few games).")
+        else:
+            detail = ("The game window is not focused, so nothing can be "
+                      "sent. Click the game - input resumes on its own.")
+        self._print(
+            f"[Health] {self.total_steps} decisions and not one key or mouse "
+            f"event has been delivered. The bot is deciding at full speed "
+            f"about a window it is not driving. {detail}")
 
     # ---- helpers ----
     def _action_label(self, action: Tuple[np.ndarray, int, int]) -> str:
@@ -487,6 +549,15 @@ class GameSession:
                     f"{self._status_novel * 1000 // steps} new states/1000 "
                     f"steps, {self._status_engaged * 100 // steps}% of steps "
                     f"pressed something")
+        stats = self._input_stats()
+        if stats:
+            self._print(
+                f"          input: "
+                f"{'focused' if stats.get('focused') else 'NOT FOCUSED'} - "
+                f"{int(stats.get('delivered') or 0)} event(s) delivered to "
+                f"{stats.get('window')}, "
+                f"{int(stats.get('skipped_unfocused') or 0)} decision(s) "
+                f"skipped while unfocused")
 
         total = sum(self._action_counts.values())
         if total:

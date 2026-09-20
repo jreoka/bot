@@ -25,7 +25,9 @@ from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 
-from .capture import FrameGrabber, FrameStack, Pacer, gray_signature
+from .capture import (FrameGrabber, FrameStack, Pacer, describe_window,
+                      get_process_name, get_window_pid, gray_signature,
+                      looks_like_non_game_process, window_risk, window_title)
 from .config import Config
 from .keys import ActionSpace, InputInjector
 
@@ -47,11 +49,23 @@ class RealGameEnv:
         self.action_space = action_space
         self.dry_run = bool(dry_run)
 
+        # The one guard that stops this program typing its actions into a shell
+        # prompt. Window selection refuses the bot's own terminal before it
+        # gets here; this is the backstop for every other way in (a stale
+        # handle in a config file, a script, a checkpoint).
+        if not self.dry_run:
+            risk = window_risk(self.hwnd)
+            if risk:
+                raise RuntimeError(
+                    f"refusing to drive {describe_window(self.hwnd)}: {risk}")
+
         self.grabber = FrameGrabber(self.hwnd)
         self.stack = FrameStack(cfg.frame_size, cfg.frame_stack)
-        self.pacer = Pacer(cfg.target_fps, cfg.capture_delay)
+        self.pacer = Pacer(cfg.target_fps, cfg.capture_delay,
+                           cfg.action_repeat)
         self.input = InputInjector(
             self.hwnd, focus_policy=getattr(cfg, "focus_policy", "once"))
+        self._window_info = self._describe_window()
 
         self.observation_shape = (self.stack.channels, cfg.frame_size,
                                   cfg.frame_size)
@@ -146,6 +160,46 @@ class RealGameEnv:
         """Is the game the window that would receive injected input?"""
         return self.input.focused()
 
+    def window_label(self) -> str:
+        """'Title' (process.exe) hwnd=N - what the bot is actually driving."""
+        return describe_window(self.hwnd)
+
+    def _describe_window(self) -> Dict[str, object]:
+        """
+        Title/process of the driven window.
+
+        Read once at startup and refreshed when the performance line prints,
+        not on every step: the handle cannot change mid-run, the title can
+        (a game renames its window per level), and ``get_process_name`` opens a
+        process handle, which is far too much work to do 20 times a second.
+        """
+        process = get_process_name(get_window_pid(self.hwnd))
+        return {"window": describe_window(self.hwnd),
+                "title": window_title(self.hwnd),
+                "process": process,
+                "non_game": looks_like_non_game_process(process)}
+
+    def input_stats(self) -> Dict[str, object]:
+        """
+        What the bot is driving, and whether anything is reaching it.
+
+        The session reports this, because "it says 20 steps a second and
+        nothing happens" is a state the rest of the log describes as healthy:
+        frames arrive, the policy decides, the buffer fills. The only number
+        that separates that from a working run is how many input events
+        Windows actually delivered, and where they went.
+        """
+        return {
+            **self._window_info,
+            "hwnd": self.hwnd,
+            "focused": self.input.focused(),
+            "delivered": self.input.events_sent,
+            "keys": self.input.keys_sent,
+            "mouse": self.input.mouse_sent,
+            "skipped_unfocused": self.input.skipped_unfocused,
+            "failures": self.input.failures,
+        }
+
     # =====================================================================
     # Environment API
     # =====================================================================
@@ -183,6 +237,11 @@ class RealGameEnv:
         perf = self.pacer.report()
         if perf:
             print(perf, flush=True)
+            self._window_info = self._describe_window()
+            if not self.dry_run:
+                # Printed next to the rate on purpose: the rate alone says the
+                # loop is alive, and this line says whether it is playing.
+                print(self.input.status_line(), flush=True)
         info = {"window_gone": gone,
                 "capture_ms": self.last_capture_ms,
                 "steps_per_second": self.pacer.achieved_hz}

@@ -47,7 +47,8 @@ import torch
 
 from . import __version__
 from .calibrate import KeyRecorder, find_toggle_vk
-from .capture import require_windows, resolve_target_window
+from .capture import (describe_window, require_windows, resolve_target_window,
+                      window_risk)
 from .config import ARCH_NAME, REWARD_VERSION, Config
 from .diagnostics import (benchmark, check_capture, list_windows, preflight,
                           release_all_keys, show_actions)
@@ -108,6 +109,10 @@ def build_parser() -> argparse.ArgumentParser:
                         help=f"target decisions per second (default {cfg.target_fps:.0f})")
     parser.add_argument("--max-held-keys", type=int, default=cfg.max_held_keys,
                         help=f"keys the bot may hold at once (default {cfg.max_held_keys})")
+    parser.add_argument("--mouse-turn", type=int, default=cfg.mouse_turn_pixels,
+                        help="pixels per mouse turn step (0 = what --calibrate "
+                             "measured; a cursor-locked game measures far too "
+                             "small, so try 20 when the view does not move)")
 
     # ---- training ----
     parser.add_argument("--rollout", type=int, default=cfg.rollout_steps,
@@ -175,6 +180,7 @@ def config_from_args(args: argparse.Namespace) -> Config:
         action_repeat=args.action_repeat,
         target_fps=args.fps,
         max_held_keys=args.max_held_keys,
+        mouse_turn_pixels=args.mouse_turn,
         rollout_steps=args.rollout,
         minibatch_size=args.minibatch,
         epochs_per_update=args.epochs,
@@ -313,16 +319,32 @@ def run_training(cfg: Config, args) -> int:
               "keys you actually use.")
     else:
         print(f"[Keymap] {keymap.describe()}")
+    keymap.set_mouse_turn(cfg.mouse_turn_pixels)
 
+    # The keymap remembers which window was calibrated, and that is the best
+    # evidence available about which window is the game. Handing it to the
+    # resolver is what keeps a maximised terminal from being auto-selected.
     target = resolve_target_window(cfg.window_hwnd,
                                    prefer_game_window=cfg.prefer_game_window,
-                                   allow_prompt=True)
+                                   allow_prompt=True,
+                                   remembered_hwnd=keymap.game_hwnd,
+                                   remembered_title=keymap.game)
     if target is None:
         print("[Window] No window selected; nothing to do.")
         return 1
     cfg.window_hwnd = int(target["hwnd"])
 
-    for warning in preflight(cfg, keymap):
+    # Safety, not politeness: the terminal this bot was started from is the
+    # largest window on most desktops, and driving it types the bot's actions
+    # into a shell prompt while the game sits untouched. Refuse outright.
+    risk = window_risk(target)
+    if risk:
+        print(f"[Window] Refusing to drive {describe_window(target)}: {risk}.")
+        print("[Window] Run --list-windows, then pass the game's handle: "
+              "--window HWND.")
+        return 1
+
+    for warning in preflight(cfg, keymap, target):
         print(f"[Check] {warning}")
 
     space = ActionSpace.build(keymap, max_held=cfg.max_held_keys,
@@ -362,6 +384,9 @@ def run_training(cfg: Config, args) -> int:
     parameters = sum(p.numel() for p in session.policy.parameters())
     print(f"  {parameters:,} parameters, torch threads "
           f"{torch.get_num_threads()}")
+    # Which window is being played, spelled out. A run that drives the wrong
+    # window otherwise looks exactly like a run that drives the right one.
+    print(f"  Driving: {env.window_label()}")
     print("-" * 74)
     start_key = str(cfg.hotkey_pause).upper()
     if cfg.wait_for_start:
@@ -448,9 +473,12 @@ def main(argv: Optional[List[str]] = None) -> int:
         return show_actions(cfg, keymap)
 
     if args.release:
+        keymap = Keymap.load(cfg.keymap_path) or Keymap.default()
         target = resolve_target_window(cfg.window_hwnd,
                                        prefer_game_window=True,
-                                       allow_prompt=True)
+                                       allow_prompt=True,
+                                       remembered_hwnd=keymap.game_hwnd,
+                                       remembered_title=keymap.game)
         if target is None:
             print("[Release] No window chosen.")
             return 1
@@ -460,16 +488,18 @@ def main(argv: Optional[List[str]] = None) -> int:
         return run_calibration(cfg, args)
 
     if args.check_capture or args.benchmark:
+        keymap = Keymap.load(cfg.keymap_path) or Keymap.default()
         target = resolve_target_window(cfg.window_hwnd,
                                        prefer_game_window=True,
-                                       allow_prompt=True)
+                                       allow_prompt=True,
+                                       remembered_hwnd=keymap.game_hwnd,
+                                       remembered_title=keymap.game)
         if target is None:
             print("[Check] No window chosen.")
             return 1
         cfg.window_hwnd = int(target["hwnd"])
         if args.check_capture:
             return check_capture(cfg, cfg.window_hwnd)
-        keymap = Keymap.load(cfg.keymap_path) or Keymap.default()
         return benchmark(cfg, keymap)
 
     torch.set_num_threads(max(1, int(cfg.torch_threads)))

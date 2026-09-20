@@ -48,6 +48,56 @@ means the bot never touches focus at all. `--start-now` skips the start key.
 Checkpoints are written to `checkpoints/` (an older `checkpoints_v2/` directory
 is moved across automatically the first time you run it).
 
+## Which window it plays, and why it will not guess
+
+Input goes to a window, so the first thing a run does is decide which one. It
+will not simply take the largest window on the desktop, because that is usually
+the terminal it was launched from — and driving your own terminal means typing
+the bot's actions into a shell prompt while the game sits untouched, at twenty
+decisions a second, with no error printed anywhere. The order is:
+
+1. `--window HWND`, if you passed one.
+2. The window the last `--calibrate` recorded: by handle if it is still open
+   and still carries the game's title, otherwise by that title — a handle
+   Windows has recycled fails the check, and a game gets a new one every
+   launch.
+3. The window you are looking at, if it looks like a game.
+4. The largest window that looks like a game.
+5. Otherwise it asks you to pick.
+
+The terminal or IDE the bot runs in, its own console, browsers and editors are
+never auto-selected, and the bot refuses to drive them even when you name one
+with `--window`. Before it starts it prints the window it is driving, with the
+process and handle, and warns when that is not the window you calibrated
+against.
+
+## If the game does not move
+
+A working run prints both of these every fifteen seconds, and the pair is the
+whole story: one line says the loop is alive, the other says it is playing.
+
+```
+[Perf]  20.0 game step(s)/s  = 10.0 decision(s)/s at action_repeat 2 (target 20)
+[Input] game window focused - 812 key event(s) and 240 mouse event(s) delivered, 0 step(s) skipped while unfocused
+```
+
+So "it says twenty steps a second and nothing happens" is readable straight off
+the log:
+
+* `[Input] game window NOT focused` — the game is not the front window. Click
+  it; input resumes on its own. The bot never fights you for focus.
+* `0 event(s) delivered` with the window focused — the keymap has not pressed
+  anything yet (the status block reports a no-op collapse), or the game ignores
+  input while its window is unfocused; `--focus always` exists for those few
+  games.
+* The view turns but nothing moves — read the whitelist printed at startup.
+  `hold=[D, 1, 2, ...]` cannot walk forward; re-running `--calibrate` while
+  actually playing the game is the fix.
+* The view never turns — the calibrated mouse step is too small. A game that
+  locks the cursor reports a nearly still cursor to the recorder, so the
+  measured step comes out at a pixel or two. `--mouse-turn 20` sets it
+  directly.
+
 ## Why it does not stall
 
 The previous design degraded after a while, for concrete reasons. Each one is

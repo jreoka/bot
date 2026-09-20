@@ -229,6 +229,28 @@ class Keymap:
         self.taps.sort(key=_sort_key)
         self.mouse_buttons.sort(key=_sort_key)
 
+    def set_mouse_turn(self, pixels: Optional[int]) -> bool:
+        """
+        Override the measured mouse step. 0 or None keeps the measurement.
+
+        Worth having as a flag because the measurement is unreliable in exactly
+        the games that need mouse-look most: a title that locks the cursor
+        (Minecraft, most first-person games) reports a nearly still cursor to a
+        low-level mouse hook, so the recorded median comes out at a couple of
+        pixels and the bot's turn step is a nudge nothing can see. The hook
+        cannot measure what the game is actually reading from the device.
+        """
+        try:
+            value = int(pixels or 0)
+        except (TypeError, ValueError):
+            return False
+        if value <= 0 or value == int(self.default_mouse_turn):
+            return False
+        print(f"[Keymap] Mouse turn step: {int(self.default_mouse_turn)} px "
+              f"(measured) -> {value} px (--mouse-turn).")
+        self.default_mouse_turn = value
+        return True
+
     def describe(self) -> str:
         return (f"hold=[{', '.join(self.holds) or '-'}]  "
                 f"tap=[{', '.join(self.taps) or '-'}]  "
@@ -465,10 +487,18 @@ class InputInjector:
         self.blocked = 0
         self.failures = 0
         self.skipped_unfocused = 0
+        # What actually left this process. Counting the events Windows
+        # accepted is the only way to tell "the bot is deciding" apart from
+        # "the bot is playing"; a run that decides 20 times a second while
+        # delivering nothing looks identical in every other number.
+        self.events_sent = 0
+        self.keys_sent = 0
+        self.mouse_sent = 0
         self.last_error: Optional[str] = None
         self._focused = False
         self._focus_attempted = False
         self._focus_warned = False
+        self._focus_notice_at = 0.0
         self._structs = None
         self.transient_vks: set = set()
 
@@ -539,9 +569,30 @@ class InputInjector:
             return
         if not self._focus_warned:
             self._focus_warned = True
+            self._focus_notice_at = time.monotonic()
             print("[Input] The game window is not focused, so nothing is being "
                   "sent. Click the game - input resumes on its own. (The "
                   "terminal can be used normally meanwhile.)", flush=True)
+        elif time.monotonic() - self._focus_notice_at >= 60.0:
+            # Repeating it once a minute matters: "the bot is running and
+            # nothing is happening" is this, and the first message is easy to
+            # miss in a wall of startup output.
+            self._focus_notice_at = time.monotonic()
+            print(f"[Input] Still sending nothing: the game window has not been "
+                  f"the front window for {self.skipped_unfocused} step(s). "
+                  f"Click the game to let the bot play it.", flush=True)
+
+    def status_line(self) -> str:
+        """One line: is input reaching a window, and how much of it."""
+        state = "focused" if self.focused() else "NOT focused"
+        line = (f"[Input] game window {state} - {self.keys_sent} key event(s) "
+                f"and {self.mouse_sent} mouse event(s) delivered, "
+                f"{self.skipped_unfocused} step(s) skipped while unfocused")
+        if self.failures:
+            line += f", {self.failures} SendInput failure(s)"
+        if self.last_error:
+            line += f" ({self.last_error})"
+        return line
 
     def end_action(self) -> None:
         self._focused = False
@@ -610,6 +661,9 @@ class InputInjector:
         if not sent:
             self.failures += 1
             self.last_error = f"SendInput(key) failed, err={ctypes.get_last_error()}"
+        else:
+            self.keys_sent += 1
+            self.events_sent += 1
 
     def _send_mouse(self, dx: int, dy: int, flags: int,
                     forcing: bool = False) -> None:
@@ -627,6 +681,9 @@ class InputInjector:
         if not sent:
             self.failures += 1
             self.last_error = f"SendInput(mouse) failed, err={ctypes.get_last_error()}"
+        else:
+            self.mouse_sent += 1
+            self.events_sent += 1
 
     # ---- public API ----
     def press_vk(self, vk: int) -> None:

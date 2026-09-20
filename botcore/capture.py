@@ -17,7 +17,7 @@ from __future__ import annotations
 import ctypes
 import os
 import time
-from typing import List, Optional, Tuple
+from typing import Dict, List, Optional, Set, Tuple
 
 import numpy as np
 
@@ -110,6 +110,8 @@ def enumerate_windows(min_area: int = 64 * 64) -> List[dict]:
     """Every visible, titled, large-enough top-level window."""
     require_windows("Listing windows")
     found: List[dict] = []
+    own = own_process_ids()
+    console = get_console_window()
 
     def visit(hwnd, _param):
         try:
@@ -131,6 +133,11 @@ def enumerate_windows(min_area: int = 64 * 64) -> List[dict]:
                 "rect": (int(left), int(top), int(width), int(height)),
                 "client": client_size(hwnd),
                 "minimized": is_minimized(hwnd),
+                # Marked here, once, so every consumer (auto-detect, the
+                # picker, the table, --window validation) agrees about which
+                # windows are the bot's own and must never be driven.
+                "own": pid > 0 and pid in own,
+                "console": bool(console) and int(hwnd) == console,
             })
         except Exception:
             pass
@@ -152,11 +159,184 @@ _SHELL_PROCESSES = {
 _SHELL_TITLES = ("program manager", "settings", "task manager")
 
 
+# Programs that are not games, in two groups.
+#
+# The first group is the one that matters, and it is the reason this table
+# exists at all: the terminal, IDE or shell the bot was *launched from*. A bot
+# that drives its own terminal types its actions into a shell prompt, and
+# because the injector only checks that the target is the *foreground* window,
+# that run looks perfectly healthy from the inside - 20 decisions a second, no
+# error, no warning - while the game sits untouched. If the bot's own window can
+# ever win "largest likely game", this failure is one keypress away.
+_TERMINAL_PROCESSES = {
+    "windowsterminal.exe", "openconsole.exe", "conhost.exe", "wt.exe",
+    "cmd.exe", "powershell.exe", "pwsh.exe", "bash.exe", "wsl.exe",
+    "mintty.exe", "putty.exe", "alacritty.exe", "wezterm-gui.exe",
+    "conemu.exe", "conemu64.exe", "tabby.exe", "hyper.exe",
+}
+# The second group is a guess rather than a hazard: driving a browser or an
+# editor is merely the wrong window, not a way to run a command. They are
+# excluded from auto-detection (a maximised browser is otherwise the largest
+# window on most desktops and beats a windowed game every time) and warned
+# about, but never refused.
+_APP_PROCESSES = {
+    "chrome.exe", "msedge.exe", "firefox.exe", "brave.exe", "opera.exe",
+    "vivaldi.exe", "iexplore.exe",
+    "code.exe", "code - insiders.exe", "devenv.exe", "notepad++.exe",
+    "sublime_text.exe", "pycharm64.exe", "idea64.exe", "rider64.exe",
+    "discord.exe", "slack.exe", "teams.exe", "ms-teams.exe", "zoom.exe",
+    "spotify.exe",
+}
+_NON_GAME_PROCESSES = _TERMINAL_PROCESSES | _APP_PROCESSES
+
+
+def looks_like_non_game_process(process: str) -> bool:
+    """Is this executable one of the known non-games (terminal, browser, IDE)?"""
+    return str(process or "").lower() in _NON_GAME_PROCESSES
+
+
+def get_console_window() -> int:
+    """
+    The console window this process writes to, or 0.
+
+    A classic console answers here; Windows Terminal and an IDE terminal do
+    not, because ConPTY hands the process a hidden pseudo-window instead of the
+    window the user can see. ``own_process_ids`` covers those.
+    """
+    if not _WINDOWS:
+        return 0
+    try:
+        return int(ctypes.windll.kernel32.GetConsoleWindow() or 0)
+    except Exception:
+        return 0
+
+
+def own_process_ids() -> Set[int]:
+    """
+    This process plus every ancestor: the shell, the terminal, the IDE.
+
+    Walking the parent chain is what makes this work where ``GetConsoleWindow``
+    does not: running the bot from Windows Terminal gives a hidden ConPTY
+    window, not the visible terminal, so the only reliable link to the window
+    the user is looking at is that Windows Terminal started the shell that
+    started the bot.
+    """
+    if not _WINDOWS:
+        return set()
+    TH32CS_SNAPPROCESS = 0x00000002
+    INVALID_HANDLE_VALUE = ctypes.c_void_p(-1).value
+
+    class PROCESSENTRY32(ctypes.Structure):
+        _fields_ = [("dwSize", ctypes.c_ulong),
+                    ("cntUsage", ctypes.c_ulong),
+                    ("th32ProcessID", ctypes.c_ulong),
+                    ("th32DefaultHeapID", ctypes.c_void_p),
+                    ("th32ModuleID", ctypes.c_ulong),
+                    ("cntThreads", ctypes.c_ulong),
+                    ("th32ParentProcessID", ctypes.c_ulong),
+                    ("pcPriClassBase", ctypes.c_long),
+                    ("dwFlags", ctypes.c_ulong),
+                    ("szExeFile", ctypes.c_char * 260)]
+
+    parents: Dict[int, int] = {}
+    try:
+        k32 = ctypes.windll.kernel32
+        k32.CreateToolhelp32Snapshot.restype = ctypes.c_void_p
+        k32.CreateToolhelp32Snapshot.argtypes = [ctypes.c_ulong, ctypes.c_ulong]
+        snapshot = k32.CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0)
+        if not snapshot or snapshot == INVALID_HANDLE_VALUE:
+            return {os.getpid()}
+        try:
+            entry = PROCESSENTRY32()
+            entry.dwSize = ctypes.sizeof(PROCESSENTRY32)
+            more = k32.Process32First(snapshot, ctypes.byref(entry))
+            while more:
+                parents[int(entry.th32ProcessID)] = int(
+                    entry.th32ParentProcessID)
+                more = k32.Process32Next(snapshot, ctypes.byref(entry))
+        finally:
+            try:
+                k32.CloseHandle(snapshot)
+            except Exception:
+                pass
+    except Exception:
+        return {os.getpid()}
+
+    ids = {os.getpid()}
+    pid = os.getpid()
+    for _ in range(16):                    # depth cap: never loop forever
+        parent = parents.get(pid, 0)
+        if not parent or parent in ids:
+            break
+        ids.add(parent)
+        pid = parent
+    return ids
+
+
+def window_is_own_process(hwnd: int) -> bool:
+    """Does this window belong to the bot, or to whatever launched it?"""
+    if not _WINDOWS or not hwnd:
+        return False
+    if int(hwnd) == get_console_window():
+        return True
+    pid = get_window_pid(int(hwnd))
+    return pid > 0 and pid in own_process_ids()
+
+
+def window_risk(win) -> str:
+    """
+    Why this window must not be driven, or '' when it looks safe to drive.
+
+    Accepts a window dict from ``enumerate_windows`` or a bare hwnd. Only
+    self-inflicted cases are refused: the bot's own terminal is a guaranteed
+    way to send every keystroke into a shell instead of a game. A browser is a
+    wrong guess, not a hazard, so it is warned about rather than blocked.
+    """
+    if win is None:
+        return ""
+    hwnd = int(win.get("hwnd") or 0) if isinstance(win, dict) else int(win or 0)
+    if not hwnd:
+        return "it has no window handle"
+    if hwnd == get_console_window():
+        return ("it is this process's own console window, so the bot would "
+                "type its actions into a shell")
+    own = bool(win.get("own")) if isinstance(win, dict) else False
+    console = bool(win.get("console")) if isinstance(win, dict) else False
+    if own or console or window_is_own_process(hwnd):
+        return ("it belongs to this process or to the shell that launched it "
+                "(the terminal/IDE), so the bot would type its actions into a "
+                "shell prompt instead of the game")
+    return ""
+
+
+def describe_window(win) -> str:
+    """'Title' (process.exe) hwnd=N, for logs."""
+    if not win:
+        return "(no window)"
+    hwnd = int(win.get("hwnd") or 0) if isinstance(win, dict) else int(win)
+    if isinstance(win, dict):
+        title, process = win.get("title") or "", win.get("process") or ""
+    else:
+        title, process = window_title(hwnd), get_process_name(
+            get_window_pid(hwnd))
+    return f"'{title or '?'}' ({process or '?'}) hwnd={hwnd}"
+
+
 def looks_like_game(win: dict) -> bool:
-    """A cheap heuristic used only to decide whether to prompt."""
+    """
+    A cheap heuristic used only to decide whether to prompt.
+
+    It refuses this process's own windows outright, however large they are, and
+    it refuses the programs a developer already has open (browsers, editors,
+    chat). Both refusals are about the same failure: auto-detection that picks
+    the biggest window on the desktop picks the terminal the bot was started
+    from.
+    """
+    if win.get("own") or win.get("console"):
+        return False
     process = (win.get("process") or "").lower()
     title = (win.get("title") or "").lower()
-    if process in _SHELL_PROCESSES:
+    if process in _SHELL_PROCESSES or process in _NON_GAME_PROCESSES:
         return False
     if any(s in title for s in _SHELL_TITLES):
         return False
@@ -178,7 +358,14 @@ def format_window_table(windows: List[dict]) -> str:
     lines = []
     for i, win in enumerate(windows, 1):
         w, h = win["rect"][2], win["rect"][3]
-        flag = " (minimized)" if win["minimized"] else ""
+        notes = []
+        if win.get("minimized"):
+            notes.append("minimized")
+        if win.get("own") or win.get("console"):
+            notes.append("the terminal the bot runs in - never driven")
+        elif looks_like_non_game_process(win.get("process") or ""):
+            notes.append("not a game")
+        flag = f"  ({'; '.join(notes)})" if notes else ""
         lines.append(f"  [{i:2}] {w:5}x{h:<5} hwnd={win['hwnd']:<10} "
                      f"{win['process'] or '?':<24} {win['title'][:44]}{flag}")
     return "\n".join(lines)
@@ -214,35 +401,136 @@ def pick_window_interactive(windows: List[dict],
         print("  That number is not in the list.")
 
 
+def _window_entry(hwnd: int) -> Optional[dict]:
+    """One window in the same shape as ``enumerate_windows``, by handle."""
+    if not hwnd or not win32gui.IsWindow(int(hwnd)):
+        return None
+    pid = get_window_pid(int(hwnd))
+    console = get_console_window()
+    try:
+        left, top, right, bottom = win32gui.GetWindowRect(int(hwnd))
+    except Exception:
+        left = top = right = bottom = 0
+    return {"hwnd": int(hwnd), "pid": pid, "title": window_title(int(hwnd)),
+            "process": get_process_name(pid),
+            "rect": (int(left), int(top), int(right - left), int(bottom - top)),
+            "client": client_size(int(hwnd)),
+            "minimized": is_minimized(int(hwnd)),
+            "own": pid > 0 and pid in own_process_ids(),
+            "console": bool(console) and int(hwnd) == console}
+
+
+def titles_match(remembered: str, current: str) -> bool:
+    """
+    Loose title comparison, because a game's title changes with its level.
+
+    Either title containing the other counts, and so does a shared first word
+    of at least three characters: "Minecraft 26.3 - Singleplayer" matches
+    "Minecraft 26.3 - Multiplayer". A handle that Windows has recycled onto an
+    unrelated window fails all three checks, which is the whole point of
+    checking - a stale handle is a wrong window.
+    """
+    a = " ".join(str(remembered or "").lower().split())
+    b = " ".join(str(current or "").lower().split())
+    if not a or not b:
+        return False
+    if a in b or b in a:
+        return True
+    return len(a.split()[0]) >= 3 and a.split()[0] == b.split()[0]
+
+
 def resolve_target_window(configured: Optional[int] = None,
                           prefer_game_window: bool = True,
-                          allow_prompt: bool = True) -> Optional[dict]:
+                          allow_prompt: bool = True,
+                          remembered_hwnd: Optional[int] = None,
+                          remembered_title: str = "") -> Optional[dict]:
     """
     Decide which window to play.
 
-    Order: an explicit hwnd, then a confident auto-detect, then the picker.
+    Order: an explicit hwnd, then the window a previous ``--calibrate``
+    recorded - by handle, then by title - then the window the user is looking
+    at, then the largest plausible game, then the picker.
+
+    The calibrated window comes second on purpose: it is the only evidence the
+    bot has that the user has already pointed at the game. Ignoring it is how a
+    run ends up driving the terminal it was launched from - which is the
+    largest window on most desktops, and the one window that must never be
+    driven, because every action would be typed into a shell prompt.
     """
     require_windows("Choosing a game window")
 
     if configured:
-        if not win32gui.IsWindow(int(configured)):
+        win = _window_entry(int(configured))
+        if win is None:
             print(f"[Window] hwnd {configured} is not a valid window.")
             return None
-        pid = get_window_pid(int(configured))
-        return {"hwnd": int(configured), "pid": pid,
-                "title": window_title(int(configured)),
-                "process": get_process_name(pid),
-                "client": client_size(int(configured))}
+        risk = window_risk(win)
+        if risk:
+            print(f"[Window] WARNING: {describe_window(win)} - {risk}.")
+            print("[Window] Pass the game's handle instead: --list-windows, "
+                  "then --window HWND.")
+        return win
+
+    if remembered_hwnd:
+        win = _window_entry(int(remembered_hwnd))
+        if win is None:
+            print(f"[Window] The window calibrated earlier (hwnd "
+                  f"{remembered_hwnd}) is not open any more; looking for the "
+                  f"game.")
+        elif win.get("own") or win.get("console"):
+            print(f"[Window] The handle calibrated earlier now points at "
+                  f"{describe_window(win)} - that is this terminal, not the "
+                  f"game. Ignoring it.")
+        elif remembered_title and not titles_match(remembered_title,
+                                                   win.get("title") or ""):
+            print(f"[Window] hwnd {remembered_hwnd} is now "
+                  f"'{win.get('title')}', not '{remembered_title}'; ignoring "
+                  f"the remembered handle, because Windows reuses them.")
+        elif not remembered_title and looks_like_non_game_process(
+                win.get("process") or ""):
+            print(f"[Window] The calibrated handle {remembered_hwnd} now "
+                  f"belongs to {win.get('process')}, which is not a game; "
+                  f"ignoring it.")
+        else:
+            print(f"[Window] Using the window you calibrated against: "
+                  f"{describe_window(win)}")
+            return win
 
     windows = enumerate_windows()
-    if prefer_game_window:
+    # The handle is often gone (a game gets a new one every launch, and Windows
+    # hands old numbers out again), but the title usually survives, so the
+    # calibration still identifies the window it was recorded against.
+    if remembered_title:
         for win in windows:
-            if looks_like_game(win):
-                print(f"[Window] Auto-selected: '{win['title']}' "
-                      f"({win['process']}) {win['rect'][2]}x{win['rect'][3]}")
-                print("[Window] Use --window to choose a different one, or run "
-                      "with --pick.")
+            if looks_like_game(win) and titles_match(remembered_title,
+                                                     win.get("title") or ""):
+                print(f"[Window] Found the game you calibrated against, by "
+                      f"title: {describe_window(win)}")
                 return win
+    if prefer_game_window:
+        ordered: List[dict] = []
+        foreground = _window_entry(int(win32gui.GetForegroundWindow() or 0))
+        if foreground is not None and looks_like_game(foreground):
+            ordered.append(foreground)
+        for win in windows:
+            if looks_like_game(win) and all(w["hwnd"] != win["hwnd"]
+                                            for w in ordered):
+                ordered.append(win)
+        if ordered:
+            chosen = ordered[0]
+            if foreground is not None and chosen["hwnd"] == foreground["hwnd"]:
+                print(f"[Window] Using the window in front: "
+                      f"{describe_window(chosen)}")
+            else:
+                print(f"[Window] Auto-selected the largest likely game: "
+                      f"{describe_window(chosen)} "
+                      f"({chosen['rect'][2]}x{chosen['rect'][3]})")
+            print("[Window] This terminal, any open browser/editor, and this "
+                  "process's own windows are never auto-selected. Use --pick "
+                  "or --window HWND for a different window.")
+            return chosen
+        print("[Window] Nothing on screen looks like a game (terminals, "
+              "browsers and editors are excluded on purpose).")
 
     if not allow_prompt:
         return None
@@ -250,7 +538,12 @@ def resolve_target_window(configured: Optional[int] = None,
     chosen = pick_window_interactive(windows)
     if chosen is None:
         return None
-    print(f"[Window] Using '{chosen['title']}' ({chosen['process']})")
+    risk = window_risk(chosen)
+    if risk:
+        print(f"[Window] WARNING: {describe_window(chosen)} - {risk}.")
+        print("[Window] Driving it would send every action into that program, "
+              "not into a game.")
+    print(f"[Window] Using {describe_window(chosen)}")
     return chosen
 
 
@@ -505,9 +798,15 @@ class Pacer:
     time to simulate in between.
     """
 
-    def __init__(self, target_fps: float, extra_sleep: float = 0.0):
+    def __init__(self, target_fps: float, extra_sleep: float = 0.0,
+                 decisions_per_step: int = 1):
         self.target_fps = max(0.0, float(target_fps))
         self.extra_sleep = max(0.0, float(extra_sleep))
+        # How many of these steps one decision is held for. Only used to label
+        # the rate honestly: with action_repeat=2 the bot takes 20 game steps a
+        # second and 10 decisions a second, and reporting one number for both
+        # is how "it says 20 steps a second" ends up meaning nothing.
+        self.decisions_per_step = max(1, int(decisions_per_step))
         self.step_seconds = 1.0 / self.target_fps if self.target_fps > 0 else 0.0
         self._next = time.perf_counter()
         self.achieved_hz = 0.0
@@ -542,7 +841,10 @@ class Pacer:
         self.achieved_hz = self._count / max(1e-6, window)
         self._count = 0
         self._last_report = now
-        line = f"[Perf] {self.achieved_hz:5.1f} steps/s"
+        line = f"[Perf] {self.achieved_hz:5.1f} game step(s)/s"
+        if self.decisions_per_step > 1:
+            line += (f"  = {self.achieved_hz / self.decisions_per_step:.1f} "
+                     f"decision(s)/s at action_repeat {self.decisions_per_step}")
         if self.target_fps > 0:
             line += f" (target {self.target_fps:.0f})"
             if self.achieved_hz < self.target_fps * 0.6:
