@@ -6799,10 +6799,6 @@ def choose_window(args, force_picker: bool = False) -> Optional[dict]:
 def main(argv: Optional[List[str]] = None) -> int:
     args = build_config(argv)
 
-    print("=" * 72)
-    print("Background RL - Proof of Concept")
-    print("=" * 72)
-
     if sys.platform != "win32":
         print("[ERROR] This script relies on Win32 APIs (PrintWindow, "
               "RegisterHotKey, SendInput) and only runs on Windows.")
@@ -6902,10 +6898,6 @@ def main(argv: Optional[List[str]] = None) -> int:
         time.sleep(3)
         audio = env.audio_capture.get_audio()
         print(f"[OK] Audio buffer: {audio.shape}, max={np.abs(audio).max():.4f}")
-
-        print("[Test] Sending a test key (W)...")
-        env.input.tap_key('W', 0.1)
-        time.sleep(0.5)
 
     loaded = None
     resume_path = None
