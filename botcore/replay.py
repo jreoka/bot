@@ -1,14 +1,14 @@
 """
-Storage for one rollout, and the recurrent minibatch sampler.
+Storage for one rollout, and the sequence minibatch sampler.
 
 Two details here matter more than they look:
 
-**The recurrent state is stored, not recomputed.** A GRU policy in PPO needs
-the hidden state that was actually in force when each action was taken.  The
-obvious shortcut - re-run the encoder over the rollout to rebuild the states -
-makes the update score old actions under a new policy, which quietly corrupts
-the importance ratio.  Storing one 192-float vector per step costs a few
-hundred kilobytes and removes the problem entirely.
+**The memory window is stored, not recomputed.** A transformer policy in PPO
+needs the window that was actually in force when each action was taken.  The
+obvious shortcut - re-run the encoder over the rollout to rebuild the windows -
+makes the update score old actions under new inputs, which quietly corrupts the
+importance ratio.  Storing one window per step costs a few hundred kilobytes per
+rollout and removes the problem entirely.
 
 **Memory is a fixed allocation.**  The arrays are allocated once at the rollout
 size and overwritten.  Nothing about this buffer grows over a run, which is one
@@ -26,28 +26,34 @@ import torch
 class RolloutBuffer:
     """Fixed-capacity storage for one on-policy rollout."""
 
-    def __init__(self, capacity: int, embed_dim: int, hidden_dim: int,
+    def __init__(self, capacity: int, embed_dim: int, mem_tokens: int,
                  n_keys: int, device: torch.device):
         self.capacity = int(capacity)
         self.embed_dim = int(embed_dim)
-        self.hidden_dim = int(hidden_dim)
+        self.mem_tokens = max(1, int(mem_tokens))
         self.n_keys = int(n_keys)
         self.device = device
         self.reset()
 
-        # Preallocated, never reallocated.
-        self._embed = np.zeros((capacity, embed_dim), dtype=np.float32)
-        self._previous = np.zeros((capacity, embed_dim), dtype=np.float32)
+        # Preallocated, never reallocated. `window` is the transformer's memory
+        # window *before* each step; `summary` is the representation of the
+        # frame that step saw, which is what the transformer's next-frame
+        # prediction is scored against one step later.
+        self._window = np.zeros((capacity, self.mem_tokens, embed_dim),
+                                dtype=np.float32)
+        self._summary = np.zeros((capacity, embed_dim), dtype=np.float32)
+        self._context = np.zeros((capacity, embed_dim), dtype=np.float32)
         self._action_vec_dim = 0
         self._action_vec: Optional[np.ndarray] = None
-        self._hidden = np.zeros((capacity, hidden_dim), dtype=np.float32)
         self._held = np.zeros((capacity, n_keys), dtype=np.float32)
         self._turn = np.zeros(capacity, dtype=np.int64)
+        self._speed = np.zeros(capacity, dtype=np.int64)
         self._tap = np.zeros(capacity, dtype=np.int64)
         self._logp = np.zeros(capacity, dtype=np.float32)
         self._value = np.zeros(capacity, dtype=np.float32)
         self._reward = np.zeros(capacity, dtype=np.float32)
         self._done = np.zeros(capacity, dtype=np.float32)
+        self._reset = np.zeros(capacity, dtype=np.float32)
 
     def reset(self) -> None:
         self.size = 0
@@ -60,10 +66,10 @@ class RolloutBuffer:
     def full(self) -> bool:
         return self.size >= self.capacity
 
-    def add(self, embed: np.ndarray, hidden: np.ndarray, held: np.ndarray,
-            turn: int, tap: int, log_prob: float, value: float,
-            reward: float, terminal: bool,
-            previous_embed: Optional[np.ndarray] = None,
+    def add(self, context: np.ndarray, summary: np.ndarray,
+            window: np.ndarray, held: np.ndarray, direction: int, speed: int,
+            tap: int, log_prob: float, value: float, reward: float,
+            terminal: bool, reset: bool = False,
             action_vector: Optional[np.ndarray] = None) -> None:
         """
         Add one transition.
@@ -74,26 +80,29 @@ class RolloutBuffer:
         Conflating the two teaches the critic that the world is about to
         vanish, which shows up as a value function that never learns anything.
 
-        ``previous_embed`` and ``action_vector`` exist so the novelty nets can
-        be trained on batches after the rollout, instead of doing a backward
-        pass inside the control loop.
+        ``reset`` does mark an inferred reset, because it invalidates the
+        transition the curiosity head would otherwise learn from: across a
+        respawn there is no "next frame" that follows from the last one.
+
+        ``action_vector`` exists so the curiosity net can be trained on batches
+        after the rollout, instead of doing a backward pass inside the control
+        loop.
         """
         if self.size >= self.capacity:
             raise RuntimeError("RolloutBuffer overflow: add() past capacity")
         i = self.size
-        self._embed[i] = embed
-        self._hidden[i] = hidden
+        self._context[i] = context
+        self._summary[i] = summary
+        self._window[i] = window
         self._held[i] = held
-        self._turn[i] = int(turn)
+        self._turn[i] = int(direction)
+        self._speed[i] = int(speed)
         self._tap[i] = int(tap)
         self._logp[i] = float(log_prob)
         self._value[i] = float(value)
         self._reward[i] = float(reward)
         self._done[i] = 1.0 if terminal else 0.0
-        if previous_embed is not None:
-            self._previous[i] = previous_embed
-        else:
-            self._previous[i] = embed
+        self._reset[i] = 1.0 if reset else 0.0
         if action_vector is not None:
             if self._action_vec is None:
                 self._action_vec_dim = int(action_vector.size)
@@ -111,16 +120,18 @@ class RolloutBuffer:
 
     def tensors(self) -> Dict[str, torch.Tensor]:
         out = {
-            "embed": self._tensor(self._embed),
-            "previous": self._tensor(self._previous),
-            "hidden": self._tensor(self._hidden),
+            "context": self._tensor(self._context),
+            "summary": self._tensor(self._summary),
+            "hidden": self._tensor(self._window),
             "held": self._tensor(self._held),
             "turn": self._tensor(self._turn, torch.long),
+            "speed": self._tensor(self._speed, torch.long),
             "tap": self._tensor(self._tap, torch.long),
             "logp": self._tensor(self._logp),
             "value": self._tensor(self._value),
             "reward": self._tensor(self._reward),
             "done": self._tensor(self._done),
+            "reset": self._tensor(self._reset),
         }
         if self._action_vec is not None:
             out["action_vector"] = self._tensor(self._action_vec)
@@ -144,11 +155,11 @@ class RolloutBuffer:
         Yield (start_indices, observation_indices) for one minibatch.
 
         A minibatch is a set of whole sequences of consecutive steps.  The
-        hidden state stored at each start index seeds the recurrence, so the
+        memory window stored at each start index seeds the transformer, so the
         forward pass sees exactly the history the policy had at the time, and
         gradients are cut at the sequence boundary.  That is the standard
-        truncated-BPTT arrangement, and it is what makes a recurrent PPO update
-        both correct and cheap.
+        truncated-BPTT arrangement, and it is what makes a transformer PPO
+        update both correct and cheap.
         """
         seq_len = max(2, int(seq_len))
         n_sequences = self.size // seq_len

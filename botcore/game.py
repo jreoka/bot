@@ -9,13 +9,16 @@ changed.  The learning layer above it never sees a window handle.
 Two deliberate choices:
 
 * **The observation is grey frames plus a difference channel.** No colour, no
-  audio.  Colour triples the encoder's input cost for very little control
+  audio.  Colour triples the model's input cost for very little control
   information, and an audio branch was measured as the single largest cost in
   the previous design while contributing almost nothing game-agnostic.
 * **Held keys are level-triggered, not edge-triggered.** The bot says which
   buttons should be down, and this module presses what is new and releases what
   is gone.  That is what lets it walk continuously instead of tapping a key
   every 33 ms.
+* **The mouse delta arrives already decided.**  Which way to swing and how far
+  are the bot's decisions, made from its own base step; this module only sends
+  the resulting pixels.
 """
 
 from __future__ import annotations

@@ -10,7 +10,8 @@ the run degrades in a way that looks exactly like "it stalls after a while".
 Three mechanisms keep that bounded:
 
 * Minibatches are whole short sequences, so the backward pass is small and
-  cache-friendly and the recurrence is truncated correctly.
+  cache-friendly and attention is truncated to the same window the rollout
+  used.
 * Every update is timed, and the *next* update decides how many minibatches it
   can afford from the measured cost.  A slow machine automatically does fewer
   passes instead of falling further behind.
@@ -34,7 +35,7 @@ from .replay import RolloutBuffer, compute_gae, normalise_advantages
 
 
 class Trainer:
-    """Owns the policy, the optimiser, and the measured cost of updating."""
+    """Owns the policy, the optimisers, and the measured cost of updating."""
 
     def __init__(self, cfg: Config, policy: ActorCritic,
                  device: torch.device):
@@ -90,26 +91,28 @@ class Trainer:
     # Collection
     # =====================================================================
     def act(self, observation: np.ndarray, hidden: torch.Tensor
-            ) -> Tuple[Tuple[np.ndarray, int, int], float, float,
-                       torch.Tensor, np.ndarray, torch.Tensor]:
+            ) -> Tuple[Tuple[np.ndarray, int, int, int], float, float,
+                       torch.Tensor, np.ndarray, np.ndarray, np.ndarray]:
         """
         One decision.
 
-        Returns the action, its log-probability, the value estimate, the new
-        hidden state, the frame embedding and the *pre-step* hidden state.  The
-        embedding is handed back so the reward nets can reuse it: the encoder
-        runs once per step, not once per consumer.
+        Returns the action, its log-probability, the value estimate, the memory
+        window for the next step, the pooled context, this frame's summary, and
+        the window that was in force *before* the decision.  The context and
+        summary are handed back so the curiosity head can reuse them: the
+        transformer runs once per step, not once per consumer.
         """
         obs = torch.as_tensor(observation, dtype=torch.float32,
                               device=self.device).unsqueeze(0)
         self.policy.eval()
         with torch.no_grad():
-            (held, turn, tap), log_prob, value, new_hidden, embed = \
-                self.policy.step(obs, hidden)
+            (held, direction, speed, tap), log_prob, value, new_hidden, \
+                context, summary = self.policy.step(obs, hidden)
         action = (held.squeeze(0).cpu().numpy().astype(np.float32),
-                  int(turn.item()), int(tap.item()))
+                  int(direction.item()), int(speed.item()), int(tap.item()))
         return (action, float(log_prob.item()), float(value.item()),
-                new_hidden, embed.squeeze(0).cpu().numpy(),
+                new_hidden, context.squeeze(0).cpu().numpy(),
+                summary.squeeze(0).cpu().numpy(),
                 hidden.squeeze(0).cpu().numpy())
     # =====================================================================
     # Update
@@ -202,29 +205,29 @@ class Trainer:
                    grid: torch.Tensor, adv: torch.Tensor, ret: torch.Tensor
                    ) -> Dict[str, float]:
         cfg = self.cfg
-        embed = tensors["embed"][grid]        # (T, B, E)
-        hidden = tensors["hidden"][grid]      # (T, B, H)  state *before* step t
+        hidden = tensors["hidden"][grid]      # (T, B, M, E) window before step t
+        summary = tensors["summary"][grid]    # (T, B, E) the frame step t saw
         held = tensors["held"][grid]
-        turn = tensors["turn"][grid]
+        direction = tensors["turn"][grid]
+        speed = tensors["speed"][grid]
         tap = tensors["tap"][grid]
         old_logp = tensors["logp"][grid]
         mb_adv = adv[grid]
         mb_ret = ret[grid]
 
-        # Score the recorded actions with the recurrent state that was in force
-        # *before* each step - the same state the action was sampled with. The
-        # frame embeddings were computed once during collection and are reused
-        # here, so the encoder does not run again.
+        # Score the recorded actions with the memory window that was in force
+        # *before* each step - the same window the action was sampled with. The
+        # frame each step saw comes from the stored summary, so the transformer
+        # reads exactly what it read during collection and the encoder does not
+        # run again.
         #
-        # This used to advance the GRU one more step and score with the result,
-        # which is the state *after* the action: the collection path used
-        # `hidden` and the update path used `gru(embed, hidden)`, so `old_logp`
+        # This used to advance the recurrence one more step and score with the
+        # result, which is the state *after* the action: the collection path used
+        # `hidden` and the update path used the advanced state, so `old_logp`
         # and `log_prob` disagreed by construction even before the optimiser
         # ran. That alone was worth a large part of the ratio error.
-        hidden_states = hidden
-
-        log_prob, entropy, value = self.policy.sequence_log_prob(
-            hidden_states, held, turn, tap)
+        log_prob, entropy, value, _context = self.policy.sequence_log_prob(
+            hidden, summary, held, direction, speed, tap)
 
         ratio = torch.exp(log_prob - old_logp)
         unclipped = ratio * mb_adv
@@ -276,6 +279,81 @@ class Trainer:
         return out
 
     # =====================================================================
+    # The curiosity head
+    # =====================================================================
+    def train_transition(self, tensors: Dict[str, torch.Tensor],
+                         minibatch: int = 256, steps: int = 2,
+                         budget_seconds: float = 0.0) -> Dict[str, float]:
+        """
+        Teach the transformer's next-frame prediction on the rollout just
+        collected.
+
+        This is the only training the curiosity signal needs: there is no
+        separate RND network and no separate forward model, because the model
+        already predicts the next frame's representation as one of its own
+        heads, and that prediction error is what the reward is built from.
+
+        The pooled context is detached (see `ActorCritic.predict_next`), so this
+        cannot bend the policy's features to make the reward look better, and the
+        PPO optimiser never sees this loss.  Stepping the trunk at all is the
+        point - a curiosity signal that never learns is a signal that never
+        fades - but it happens through its own Adam, not through the policy
+        gradient.
+
+        Pairs that span an inferred reset are dropped: across a respawn there is
+        no "next frame" that follows from the last one, and training on it would
+        teach the model that the world is unpredictable exactly where the bot
+        needs it to recognise a restart.
+        """
+        if steps <= 0:
+            return {}
+        context = tensors.get("context")
+        summary = tensors.get("summary")
+        reset = tensors.get("reset")
+        if context is None or summary is None or context.shape[0] < 2:
+            return {}
+        # Step t predicts the summary of step t+1.
+        predictor = context[:-1]
+        target = summary[1:].detach()
+        valid = torch.ones(predictor.shape[0], dtype=torch.bool,
+                           device=context.device)
+        if reset is not None:
+            valid = reset[1:] < 0.5
+        if int(valid.sum()) == 0:
+            return {}
+        predictor = predictor[valid]
+        target = target[valid]
+
+        n = int(predictor.shape[0])
+        batch = max(1, min(int(minibatch), n))
+        rng = np.random.default_rng(0)
+        order = np.arange(n)
+        started = time.perf_counter()
+        out: Dict[str, float] = {}
+        batches = 0
+        for _ in range(max(1, int(steps))):
+            rng.shuffle(order)
+            for start in range(0, n, batch):
+                idx = torch.as_tensor(order[start:start + batch],
+                                      dtype=torch.long, device=context.device)
+                prediction = self.policy.predict_next(predictor[idx])
+                loss = F.mse_loss(prediction, target[idx])
+                self.policy.transition_optimizer.zero_grad(set_to_none=True)
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(
+                    list(self.policy.transition.parameters())
+                    + list(self.policy.transition_norm.parameters()), 1.0)
+                self.policy.transition_optimizer.step()
+                out["transition_loss"] = float(loss.detach().item())
+                batches += 1
+                if budget_seconds > 0 and \
+                        time.perf_counter() - started >= budget_seconds:
+                    out["transition_batches"] = float(batches)
+                    return out
+        out["transition_batches"] = float(batches)
+        return out
+
+    # =====================================================================
     # Diagnostics
     # =====================================================================
     def nonfinite_parameters(self) -> List[str]:
@@ -296,5 +374,6 @@ class Trainer:
                 f"kl {m.get('approx_kl', 0.0):+.4f} "
                 f"clip {100.0 * m.get('clip_fraction', 0.0):.0f}% "
                 f"ev {m.get('explained_variance', 0.0):+.2f} "
+                f"fwd {m.get('transition_loss', 0.0):.4f} "
                 f"| {m.get('seconds', 0.0):.2f}s/"
                 f"{int(m.get('minibatches', 0))}mb")

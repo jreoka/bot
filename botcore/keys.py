@@ -10,12 +10,13 @@ cannot be learned, so there is no path by which the bot reaches into a game's
 menus or its own dev overlays.
 
 **The factored action space.**  The obvious encoding - one action per
-combination of held keys, look direction and click - explodes into hundreds of
-discrete actions, most of which are nonsense ("hold W+A+S+D and turn left and
-right-click").  Instead the action is three independent decisions:
+combination of held keys, look direction, turn distance and click - explodes
+into hundreds of discrete actions, most of which are nonsense ("hold W+A+S+D and
+turn left and right-click").  Instead the action is four independent decisions:
 
-    held keys   |S| + 1 choices   (which key to toggle, or nothing)
-    turn        |T| + 1 choices   (how far to swing the view, or not at all)
+    held keys   |S| + 1 choices   (which key to hold, capped at k at once)
+    direction   |D| + 1 choices   (which way to swing the view, or not at all)
+    speed       |V| choices       (the multiplier on the bot's own mouse step)
     tap/click   |A| + 1 choices   (one momentary button, or nothing)
 
 Each decision has its own policy head, each is trained by the same PPO update,
@@ -23,6 +24,12 @@ and the bot can still learn combinations (holding W while turning) because the
 heads are sampled together and credited together.  The decision count stays in
 the tens instead of the hundreds, which is the difference between an action
 space the bot can explore and one it cannot.
+
+Splitting "which way" from "how far" is what lets the bot own its mouse speed.
+The distance is not a fixed list of pixel deltas tuned by hand: it is a
+multiplier, chosen per decision, on a base step the model carries as its own
+state.  A game whose view speed nobody told the bot about is then a problem the
+bot can solve rather than a constant that has to be right at launch.
 """
 
 from __future__ import annotations
@@ -93,6 +100,18 @@ _KEY_PRIORITY = ["W", "A", "S", "D", "SPACE", "LSHIFT", "LCTRL",
 DEFAULT_HOLD_KEYS = ["W", "A", "S", "D", "SPACE", "LSHIFT", "LCTRL"]
 DEFAULT_TAP_KEYS = ["E", "Q", "1", "2", "3", "4"]
 DEFAULT_MOUSE_BUTTONS = ["MOUSE_LEFT", "MOUSE_RIGHT"]
+
+
+# The four ways a view can swing, plus "do not turn". This is a direction, not a
+# distance: how far the mouse actually moves is the bot's speed decision (see
+# ActionSpace.turn_pixels), so a direction is all the head has to choose.
+_DIRECTIONS: List[Tuple[str, Tuple[int, int]]] = [
+    ("no turn", (0, 0)),
+    ("left", (-1, 0)),
+    ("right", (1, 0)),
+    ("up", (0, -1)),
+    ("down", (0, 1)),
+]
 
 
 def key_name(vk: int, extended: bool = False) -> str:
@@ -296,16 +315,27 @@ class Keymap:
 @dataclass
 class ActionSpace:
     """
-    Three independent decisions, plus the code that turns them into input.
+    Four independent decisions, plus the code that turns them into input.
 
         held_keys : indices into `hold_names`, at most max_held at once
-        turns     : (dx, dy) pixel deltas; index 0 is always "do not turn"
+        direction : index into `directions`; 0 is "do not turn"
+        speed     : index into `speed_levels`, the multiplier on the bot's own
+                    base mouse step (this is the mouse speed the bot sets)
         taps      : momentary buttons; index 0 is always "press nothing"
+
+    The turn is deliberately split in two.  A player decides "swing left" and
+    "how far" separately, and so does this bot: the direction head says which
+    way, and the speed head says how many pixels - as a multiple of a base step
+    the model carries as a buffer of its own and can move between
+    `mouse_turn_min` and `mouse_turn_max`.  Splitting it keeps the head small
+    (5 directions x 5 speeds instead of 20 hand-tuned pixel deltas), and it is
+    what lets the same policy work in a game whose view speed nobody told it.
     """
 
     hold_names: List[str] = field(default_factory=list)
     hold_vks: List[int] = field(default_factory=list)
-    turns: List[Tuple[int, int]] = field(default_factory=list)
+    directions: List[Tuple[str, Tuple[int, int]]] = field(default_factory=list)
+    speed_levels: List[float] = field(default_factory=list)
     taps: List[dict] = field(default_factory=list)
     max_held: int = 4
     mouse_enabled: bool = True
@@ -318,50 +348,90 @@ class ActionSpace:
 
     @property
     def n_turn(self) -> int:
-        return len(self.turns) if self.turns else 1
+        return max(1, len(self.directions))
+
+    @property
+    def n_speed(self) -> int:
+        return max(1, len(self.speed_levels))
 
     @property
     def n_tap(self) -> int:
         return len(self.taps) if self.taps else 1
 
     @property
-    def head_sizes(self) -> Tuple[int, int, int]:
-        return (self.n_hold, self.n_turn, self.n_tap)
+    def head_sizes(self) -> Tuple[int, int, int, int]:
+        return (self.n_hold, self.n_turn, self.n_speed, self.n_tap)
 
     @property
     def action_vector_size(self) -> int:
         """Width of the one-hot action description fed to the reward nets."""
-        return self.n_hold + self.n_turn + self.n_tap
+        return self.n_hold + self.n_turn + self.n_speed + self.n_tap
 
-    def action_vector(self, held_idx: int, turn_idx: int, tap_idx: int
-                      ) -> np.ndarray:
+    @property
+    def turn_pixels(self) -> List[int]:
+        """Pixels one 1x step moves, per speed level, for display."""
+        return [max(1, int(round(float(level)))) for level in self.speed_levels]
+
+    def action_vector(self, held_idx: int, turn_idx: int, speed_idx: int,
+                      tap_idx: int) -> np.ndarray:
         """Flat one-hot description of a decision, for the novelty nets."""
         vec = np.zeros(self.action_vector_size, dtype=np.float32)
         vec[max(0, min(held_idx, self.n_hold - 1))] = 1.0
         offset = self.n_hold
         vec[offset + max(0, min(turn_idx, self.n_turn - 1))] = 1.0
         offset += self.n_turn
+        vec[offset + max(0, min(speed_idx, self.n_speed - 1))] = 1.0
+        offset += self.n_speed
         vec[offset + max(0, min(tap_idx, self.n_tap - 1))] = 1.0
         return vec
 
+    def turn_delta(self, direction_index: int, speed_index: int,
+                   base_pixels: int) -> Tuple[int, int]:
+        """
+        The mouse delta for a (direction, speed) decision at this base step.
+
+        ``base_pixels`` comes from the model, not from a constant here: the bot
+        moves its own base step, and this is only the multiplication that turns
+        a decision into pixels.
+        """
+        _name, (dx, dy) = self.direction(direction_index)
+        if dx == 0 and dy == 0:
+            return (0, 0)
+        level = self.speed_level(speed_index)
+        step = max(1, int(round(float(max(1, base_pixels)) * level)))
+        return (int(dx) * step, int(dy) * step)
+
+    def direction(self, index: int) -> Tuple[str, Tuple[int, int]]:
+        if 0 <= int(index) < len(self.directions):
+            return self.directions[int(index)]
+        return ("no turn", (0, 0))
+
+    def speed_level(self, index: int) -> float:
+        if 0 <= int(index) < len(self.speed_levels):
+            return float(self.speed_levels[int(index)])
+        return 1.0
+
     # ---- labels ----
-    def label(self, held_idx: int, turn_idx: int, tap_idx: int) -> str:
+    def label(self, held_idx: int, turn_idx: int, speed_idx: int,
+              tap_idx: int) -> str:
         parts: List[str] = []
         if 0 <= held_idx < len(self.hold_vks):
             parts.append(self.hold_names[held_idx])
-        if 0 < turn_idx < len(self.turns):
-            dx, dy = self.turns[turn_idx]
-            parts.append(f"turn({dx:+d},{dy:+d})")
+        name, delta = self.direction(turn_idx)
+        if delta != (0, 0):
+            parts.append(f"turn {name} x{self.speed_level(speed_idx):g}")
         if 0 < tap_idx < len(self.taps):
             parts.append(str(self.taps[tap_idx].get("label", "?")))
         return "+".join(parts) if parts else "noop"
 
-    def is_noop(self, held_idx: int, turn_idx: int, tap_idx: int) -> bool:
+    def is_noop(self, held_idx: int, turn_idx: int, speed_idx: int,
+                tap_idx: int) -> bool:
         """True when this decision presses nothing at all."""
-        return (held_idx == 0 and turn_idx == 0 and tap_idx == 0)
+        _name, delta = self.direction(turn_idx)
+        return (held_idx == 0 and delta == (0, 0) and tap_idx == 0)
 
-    def describe_action(self, held: np.ndarray, turn: int, tap: int
-                        ) -> np.ndarray:
+    def describe_action(self, held: np.ndarray, turn: int, speed: int,
+                        tap: int) -> np.ndarray:
         """
         Flat action description for the novelty nets.
 
@@ -375,14 +445,16 @@ class ActionSpace:
         if held.size:
             set_bits = np.flatnonzero(held > 0.5)
             first = int(set_bits[0]) + 1 if set_bits.size else 0
-        return self.action_vector(first, int(turn), int(tap))
+        return self.action_vector(first, int(turn), int(speed), int(tap))
 
     # ---- serialisation ----
     def to_dict(self) -> dict:
         return {
             "hold_names": list(self.hold_names),
             "hold_vks": list(self.hold_vks),
-            "turns": [list(t) for t in self.turns],
+            "directions": [[name, list(delta)]
+                           for name, delta in self.directions],
+            "speed_levels": [float(s) for s in self.speed_levels],
             "taps": [dict(t) for t in self.taps],
             "max_held": int(self.max_held),
             "mouse_enabled": bool(self.mouse_enabled),
@@ -393,7 +465,9 @@ class ActionSpace:
         return cls(
             hold_names=list(data.get("hold_names") or []),
             hold_vks=[int(v) for v in (data.get("hold_vks") or [])],
-            turns=[(int(t[0]), int(t[1])) for t in (data.get("turns") or [])],
+            directions=[(str(d[0]), (int(d[1][0]), int(d[1][1])))
+                        for d in (data.get("directions") or [])],
+            speed_levels=[float(s) for s in (data.get("speed_levels") or [])],
             taps=[dict(t) for t in (data.get("taps") or [])],
             max_held=int(data.get("max_held") or 4),
             mouse_enabled=bool(data.get("mouse_enabled", True)),
@@ -402,27 +476,23 @@ class ActionSpace:
     # ---- construction ----
     @classmethod
     def build(cls, keymap: Keymap, max_held: int = 4,
-              turn_levels: Sequence[Tuple[str, float]] = (
-                  ("fine", 0.4), ("normal", 1.0), ("fast", 2.5)),
+              speed_levels: Sequence[float] = (0.25, 0.5, 1.0, 2.0, 4.0),
               mouse_enabled: bool = True,
               include_mouse_taps: bool = True) -> "ActionSpace":
         """
         Derive the action space from a keymap.
 
-        Turns are generated from the keymap's calibrated pixels-per-step scaled
-        by each configured level, in four directions, which is what makes a
-        fine aiming correction and a spin on the spot the same kind of decision.
+        The keymap supplies the keys and the base mouse step; the speed levels
+        are multipliers on that base, and the bot owns the base.  A keymap
+        recorded from a cursor-locked game measures a base of one or two pixels,
+        which is why the top multiplier is generous: the bot has to be able to
+        find a usable turn speed even when the recording could not.
         """
-        base = max(1, int(keymap.default_mouse_turn))
-
         hold_names = sorted(keymap.holds, key=_sort_key)
         hold_vks = [int(keymap.vks[n]) for n in hold_names if keymap.vks.get(n)]
 
-        turns: List[Tuple[int, int]] = [(0, 0)]
-        if mouse_enabled:
-            for _level_name, scale in turn_levels:
-                step = max(1, int(round(base * float(scale))))
-                turns.extend([(-step, 0), (step, 0), (0, -step), (0, step)])
+        directions = list(_DIRECTIONS) if mouse_enabled else [_DIRECTIONS[0]]
+        levels = [float(s) for s in speed_levels] or [1.0]
 
         taps: List[dict] = [{"label": "nothing", "vk": 0}]
         for name in sorted(keymap.taps, key=_sort_key):
@@ -435,15 +505,19 @@ class ActionSpace:
                 if vk not in hold_vks and vk not in [t["vk"] for t in taps]:
                     taps.append({"label": f"click:{button}", "vk": int(vk)})
 
-        return cls(hold_names=hold_names, hold_vks=hold_vks, turns=turns,
-                   taps=taps, max_held=max(1, int(max_held)),
+        return cls(hold_names=hold_names, hold_vks=hold_vks,
+                   directions=directions, speed_levels=levels, taps=taps,
+                   max_held=max(1, int(max_held)),
                    mouse_enabled=bool(mouse_enabled))
 
     def describe(self) -> str:
+        speeds = "/".join(f"{float(s):g}" for s in self.speed_levels)
         return (f"{len(self.hold_vks)} hold key(s) "
-                f"(<= {self.max_held} at once), {self.n_turn} turn choice(s), "
+                f"(<= {self.max_held} at once), {self.n_turn} turn "
+                f"direction(s) x {self.n_speed} speed(s) x[{speeds}], "
                 f"{self.n_tap} tap/click choice(s)  ->  "
-                f"{self.n_hold * self.n_turn * self.n_tap} combinations")
+                f"{self.n_hold * self.n_turn * self.n_speed * self.n_tap} "
+                f"combinations (the bot's own base step sets the pixels)")
 
 
 # =============================================================================

@@ -150,7 +150,8 @@ def show_actions(cfg: Config, keymap: Keymap) -> int:
     """Print the action space this keymap produces."""
     keymap.set_mouse_turn(cfg.mouse_turn_pixels)
     space = ActionSpace.build(keymap, max_held=cfg.max_held_keys,
-                              turn_levels=cfg.turn_levels)
+                              speed_levels=cfg.speed_levels)
+    base = max(1, int(keymap.default_mouse_turn))
     print()
     print("-" * 74)
     print("  ACTION SPACE")
@@ -164,10 +165,20 @@ def show_actions(cfg: Config, keymap: Keymap) -> int:
     for index, name in enumerate(space.hold_names):
         print(f"    [{index}] {name}")
     print()
-    print("  Turning (one choice per step):")
-    for index, (dx, dy) in enumerate(space.turns):
-        print(f"    [{index}] " + ("do not turn" if (dx, dy) == (0, 0)
-                                   else f"move mouse by ({dx:+d}, {dy:+d})"))
+    print("  Turning (two choices per step: which way, and how fast).")
+    print(f"  The base step is the bot's own: it starts at {base}px and the")
+    print(f"  bot moves it inside [{cfg.mouse_turn_min}, {cfg.mouse_turn_max}]"
+          f" pixels as it learns this game.")
+    print("    directions:")
+    for index, (name, delta) in enumerate(space.directions):
+        rendered = ("do not turn" if delta == (0, 0)
+                    else f"move mouse by {delta[0]:+d}, {delta[1]:+d} per 1x")
+        print(f"      [{index}] {name:<9} {rendered}")
+    print("    speeds (multipliers on the base step):")
+    for index, level in enumerate(space.speed_levels):
+        pixels = max(1, int(round(base * float(level))))
+        print(f"      [{index}] x{float(level):<5g} -> {pixels:+d}px from the "
+              f"current {base}px base")
     print()
     print("  Tap / click (one choice per step):")
     for index, entry in enumerate(space.taps):
@@ -196,7 +207,7 @@ def benchmark(cfg: Config, keymap: Keymap, decisions: int = 120) -> int:
 
     keymap.set_mouse_turn(cfg.mouse_turn_pixels)
     space = ActionSpace.build(keymap, max_held=cfg.max_held_keys,
-                              turn_levels=cfg.turn_levels)
+                              speed_levels=cfg.speed_levels)
     try:
         from .session import GameSession
     except Exception as exc:
@@ -253,8 +264,10 @@ def benchmark(cfg: Config, keymap: Keymap, decisions: int = 120) -> int:
             print("         Cross-check with: python bot1.py --check-capture")
         else:
             print(f"         The time is in the model ({model_ms:.0f} ms). "
-                  f"Lower frame_size (now {cfg.frame_size}) or frame_stack "
-                  f"(now {cfg.frame_stack}), and keep torch_threads at 1.")
+                  f"Lower embed_dim (now {cfg.embed_dim}), mem_tokens (now "
+                  f"{cfg.mem_tokens}), transformer_layers (now "
+                  f"{cfg.transformer_layers}) or frame_size (now "
+                  f"{cfg.frame_size}), and keep torch_threads at 1.")
     else:
         print("  [OK]   Fast enough for the target rate.")
     print("-" * 74)
@@ -296,15 +309,14 @@ def action_space_advice(cfg: Config, keymap: Keymap,
             f"this game calls forward).")
     if keymap is not None and int(keymap.default_mouse_turn) < 4:
         lines.append(
-            f"The mouse turn step is {int(keymap.default_mouse_turn)} px, which "
-            f"is the signature of a game that locks the cursor: the recorder "
-            f"cannot see the real look speed, so every 'turn' decision is a "
-            f"twitch. The view will not move and the bot cannot aim.")
-        lines.append(
-            f"Fix: pass --mouse-turn 20 (or more) and watch whether the view "
-            f"actually turns. Try --check-capture while pressing the turn key "
-            f"if you are not sure.")
-    taps = {str(t.get("label", "")) for t in space.taps}
+            f"The measured mouse turn step is {int(keymap.default_mouse_turn)} "
+            f"px, which is the signature of a game that locks the cursor: the "
+            f"recorder cannot see the real look speed, so the measurement is a "
+            f"twitch. The bot now sets its own speed - it starts from this "
+            f"number, scales it up when a turn does not move the view, and "
+            f"chooses the multiplier per decision - so this is not fatal. If "
+            f"the view still never turns, pass --mouse-turn 20 (or more) to "
+            f"start it higher.")
     if len(space.taps) > 6:
         lines.append(
             f"{len(space.taps)} tap/click choices are enabled, so a large share "
@@ -328,7 +340,7 @@ def preflight(cfg: Config, keymap: Optional[Keymap],
     if keymap is not None:
         try:
             space = ActionSpace.build(keymap, max_held=cfg.max_held_keys,
-                                      turn_levels=cfg.turn_levels)
+                                      speed_levels=cfg.speed_levels)
         except Exception:
             space = None
     if space is not None:
@@ -379,6 +391,7 @@ def preflight_warnings(cfg: Config, keymap: Optional[Keymap],
                 f"The mouse turn step is {int(keymap.default_mouse_turn)} "
                 f"pixel(s) (measured median {measured:.1f} px at calibration). "
                 f"A game that locks the cursor hides your real look speed from "
-                f"the recorder, so this is usually far too small for the bot "
-                f"to turn with.")
+                f"the recorder. The bot starts from this number and scales it "
+                f"up on its own when turns do not move the view, but if you "
+                f"already know the right step, --mouse-turn sets it.")
     return warnings

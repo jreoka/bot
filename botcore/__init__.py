@@ -3,10 +3,11 @@ botcore - a small, CPU-friendly, game-agnostic reinforcement-learning bot.
 
 The design goals, in the order they constrained the code:
 
-1. **Light.**  One small CNN and one GRU cell run per control step.  There is
-   no transformer, no audio branch and no giant action table.  A control step
-   costs single-digit milliseconds on a laptop CPU, so the bot spends its time
-   watching the game rather than thinking about it.
+1. **Light.**  One small SwiGLU + RoPE transformer runs per control step, and it
+   is the only model in the process: its own next-frame prediction is the
+   curiosity signal, so there is no side network to run, train or store.  A
+   control step costs single-digit milliseconds on a laptop CPU, so the bot
+   spends its time watching the game rather than thinking about it.
 
 2. **It cannot stall.**  Every loop in the program has a hard bound, and every
    structure that grows has a cap.  A watchdog measures the real per-step and

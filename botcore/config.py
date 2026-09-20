@@ -51,8 +51,9 @@ class Config:
     #
     # Frames are converted to grayscale once, resized once, and then the model
     # sees the last `frame_stack` of them plus their first difference. Stacking
-    # grey frames is how the bot perceives motion, and it costs nothing extra:
-    # the CNN always runs on the same fixed number of channels.
+    # grey frames is how the bot perceives motion without the model having to
+    # infer it from a single image, and it costs nothing extra: the patch
+    # embedding always runs on the same fixed number of channels.
     # =====================================================================
     frame_size: int = 96
     frame_stack: int = 4
@@ -82,16 +83,36 @@ class Config:
     # =====================================================================
     # Model
     #
-    # Deliberately small. The CNN turns one frame into a vector; a GRU carries
-    # memory across steps. That is enough for pixel control and costs a
-    # fraction of a transformer over a stack of frames, with no sequence-length
-    # squared term anywhere.
+    # One model: a causal SwiGLU + RoPE transformer over a rolling window of
+    # frame representations.  Deliberately small, because it runs on a CPU
+    # beside the game:
+    #
+    #   embed_dim        width of every token and of the memory window
+    #   mem_tokens       how many past frames the window holds. This is the
+    #                    transformer's entire memory, and it is the number that
+    #                    trades context for per-step cost: attention is over
+    #                    (mem_tokens + patch tokens), so doubling it roughly
+    #                    triples the attention work (the SwiGLU blocks dominate
+    #                    at these sizes, which is why a bigger window is
+    #                    affordable at all).
+    #   patch_size       pixels per patch token; patch_width is the width of the
+    #                    single convolution that turns patches into tokens.
+    #                    The transformer does the sequence work - there is no
+    #                    CNN stack in front of it.
+    #   ffn_hidden       SwiGLU hidden width (2 * embed_dim is the usual ratio)
     # =====================================================================
-    embed_dim: int = 128
-    hidden_dim: int = 192
-    cnn_width: int = 32
-    # Recurrent truncated-backprop length for PPO updates. Longer sees further
-    # back but costs more per update; 16 is a good CPU compromise.
+    embed_dim: int = 96
+    mem_tokens: int = 16
+    patch_size: int = 16
+    patch_width: int = 64
+    transformer_layers: int = 2
+    ffn_hidden: int = 192
+    attention_heads: int = 4
+    attention_dropout: float = 0.0
+    # Sequence length used to truncate the PPO update. The memory window is
+    # rebuilt inside the update from stored summaries, and gradients are cut at
+    # the sequence boundary; 16 is the usual CPU compromise between seeing
+    # further back and costing more per update.
     seq_len: int = 16
 
     # =====================================================================
@@ -119,8 +140,8 @@ class Config:
     # =====================================================================
     # Learning signal
     #
-    # Four terms, all computed from pixels and the buttons pressed. No game
-    # knowledge, no score reading, no manual feedback.
+    # Four groups of terms, all computed from pixels and the buttons pressed.
+    # No game knowledge, no score reading, no manual feedback.
     # =====================================================================
     # Episodic novelty: reaching a state never reached since the last reset.
     # This is the term that rewards *progress*; everything else is support.
@@ -140,19 +161,17 @@ class Config:
     # term is too sparse to provide on its own. Kept smaller than the episodic
     # weight: a large potential-style difference can cancel the sparse bonus
     # and leave the bot with no preference between exploring and re-treading.
-    w_progress: float = 0.5
+    w_depth_progress: float = 0.5
     # What a repeat visit to an already-seen state is worth, as a fraction of a
     # first visit. Well below 1 so exploring beats re-treading, and above 0 so
     # the reward does not vanish in a long episode.
     novelty_decay: float = 0.5
-    # Random network distillation: prediction error of a fixed random network,
-    # scaled by its own running spread. Broad, cheap curiosity that keeps the
-    # bot moving in the very first steps, before it has discovered anything,
-    # and fades on its own as states become familiar. Kept quieter than the
-    # episodic term on purpose: raw RND error is largest where the screen is
-    # most chaotic, so a loud version buys a bot that stares at whatever
-    # flickers hardest.
-    w_rnd: float = 1.0
+    # How many steps a fresh episode must last before the per-state novelty
+    # bonus is paid in full. An inferred reset clears the episodic memory, so
+    # without this a policy that dies every other step is paid for "new" states
+    # every other step - the reward farms resets, and the bot learns to die.
+    # Ramping it in makes a two-step life worth almost nothing.
+    novelty_survival_steps: float = 12.0
     # A small charge for pressing nothing, growing while nothing is pressed, so
     # that inaction is never the free option. Without this the safest action is
     # noop and a policy can settle there permanently.
@@ -220,32 +239,76 @@ class Config:
     global_capacity: int = 200000
 
     # =====================================================================
-    # RND / forward model
+    # The transformer's own curiosity head
+    #
+    # The model predicts the next frame's representation; its error is the
+    # novelty signal the reward is built from, so no second network exists.
+    # `transition_hidden` is the width of the small MLP that does the
+    # predicting, and `transition_lr` is its own learning rate (it is trained by
+    # its own optimiser so a curiosity gradient never moves the policy's trunk).
     # =====================================================================
-    rnd_dim: int = 128
-    rnd_hidden: int = 256
-    # Plain SGD on purpose: a two-layer MLP does not need an adaptive
-    # optimiser, and this keeps its per-step cost and memory flat.
-    rnd_lr: float = 0.02
-    fwd_lr: float = 0.02
+    transition_hidden: int = 192
+    transition_lr: float = 3e-4
+    # Curiosity is paid for prediction error in units of how much that error
+    # usually varies, so the weight means the same thing on hour ten as on hour
+    # one - and so a bot sitting in front of a noisy screen is not paid more
+    # than one making progress. `w_novelty_cap` stops a single chaotic frame
+    # from dominating a rollout.
+    #
+    # There is no separate "learning progress" weight: a term that pays for the
+    # prediction error falling was measured to invert the reward on the
+    # synthetic corridor (standing still scored 61% of walking forward), so the
+    # count-based episodic term is what carries progress instead.
+    w_novelty: float = 1.0
+    w_novelty_cap: float = 2.0
+    # How fast the running estimate of "ordinary prediction error" follows the
+    # signal. It must track the model's own improvement - as the predictor gets
+    # better everywhere, what counts as surprising falls with it - without
+    # becoming so fast that a single chaotic frame redefines "ordinary".
+    error_decay: float = 0.99
 
     # =====================================================================
     # Input budget
     #
     # A bot that can hold eleven keys at once will spend its life in menus. The
-    # action space is therefore factored - which keys are held, how far to turn,
-    # what to tap - and the number of simultaneously held keys is capped.
+    # action space is therefore factored - which keys are held, which way to
+    # turn, how fast to turn, what to tap - and the number of simultaneously
+    # held keys is capped.
     # =====================================================================
     max_held_keys: int = 4
-    # Override for how many pixels one mouse-turn step is. 0 = use what
-    # --calibrate measured, which is right only when the game lets the cursor
-    # move: a game that locks the cursor (Minecraft, most first-person titles)
-    # reports a still cursor to the recorder, so the measurement comes out at
-    # one or two pixels and the bot cannot turn its view at all. --mouse-turn
-    # sets it directly.
+
+    # ---- mouse speed: the bot sets its own ----
+    #
+    # The view-depth decision is two things a player decides separately: which
+    # way to swing, and how far. "How far" is a *speed*, and the bot owns it:
+    #
+    #   * the policy has a speed head, so the multiplier on any turn is a
+    #     decision it makes and PPO trains like any other;
+    #   * `mouse_turn_start` is the base step the multiplier applies to, in
+    #     pixels. `mouse_turn_pixels` pins it when the user knows better
+    #     (--mouse-turn, or a --calibrate recording), otherwise --calibrate's
+    #     measurement is used, and the bot is free to move the base within
+    #     [mouse_turn_min, mouse_turn_max] as it learns what this game's view
+    #     actually needs.
+    #
+    # That range is what makes a cursor-locked game survivable: such a title
+    # hides the real look speed from the recorder, so the measured step comes
+    # out at a pixel or two, and a bot that could only ever use the measurement
+    # could never turn its view at all.
     mouse_turn_pixels: int = 0
-    turn_levels: Tuple[Tuple[str, float], ...] = (
-        ("fine", 0.4), ("normal", 1.0), ("fast", 2.5))
+    mouse_turn_start: int = 20
+    mouse_turn_min: int = 4
+    mouse_turn_max: int = 120
+    # The multipliers the speed head chooses between, applied to the base step.
+    # The top entry has to be large enough to be a real spin on the spot and the
+    # bottom one small enough to be an aim correction; what sits between them is
+    # what the bot uses to match a game it has never seen.
+    speed_levels: Tuple[float, ...] = (0.25, 0.5, 1.0, 2.0, 4.0)
+    # How hard the bot is allowed to correct its own base step when the view
+    # turns by far less (or far more) than the pixels it sent. 0 disables the
+    # correction and leaves the base where it started.
+    mouse_adapt_rate: float = 0.08
+
     # Virtual keys the recorder refuses to learn and the bot refuses to press.
     # F1/F3 are hardware/debug overlays in many games; unbinding them keeps the
     # bot from reaching into the game's own settings or its dev overlays. 0x70 =
@@ -312,8 +375,8 @@ class Config:
         """Fail loudly here rather than three hours into a run."""
         if self.frame_size < 40:
             raise ValueError(
-                f"frame_size {self.frame_size} is too small; the encoder needs "
-                f"at least 40 (96 is the default)")
+                f"frame_size {self.frame_size} is too small; the patch "
+                f"embedding needs at least 40 (96 is the default)")
         if self.frame_stack < 1:
             raise ValueError("frame_stack must be at least 1")
         if self.action_repeat < 1:
@@ -328,10 +391,41 @@ class Config:
             self.minibatch_size = self.seq_len
         if self.max_held_keys < 1:
             raise ValueError("max_held_keys must be at least 1")
+        if self.embed_dim < 8:
+            raise ValueError("embed_dim must be at least 8")
         if self.embed_dim % 4 != 0:
             raise ValueError("embed_dim must be divisible by 4")
-        if self.hidden_dim < 4:
-            raise ValueError("hidden_dim must be at least 4")
+        if self.mem_tokens < 1:
+            raise ValueError("mem_tokens must be at least 1")
+        if self.patch_size < 2:
+            raise ValueError("patch_size must be at least 2")
+        if self.transformer_layers < 1:
+            raise ValueError("transformer_layers must be at least 1")
+        if self.ffn_hidden < self.embed_dim:
+            raise ValueError("ffn_hidden must be at least embed_dim")
+        if self.attention_heads < 1:
+            raise ValueError("attention_heads must be at least 1")
+        if self.embed_dim % self.attention_heads != 0:
+            raise ValueError(
+                f"embed_dim {self.embed_dim} must be divisible by "
+                f"attention_heads {self.attention_heads}")
+        if (self.embed_dim // self.attention_heads) % 2 != 0:
+            raise ValueError(
+                f"embed_dim / attention_heads must be even for rotary "
+                f"position embedding (got "
+                f"{self.embed_dim // self.attention_heads})")
+        if not self.speed_levels:
+            raise ValueError("speed_levels must list at least one multiplier")
+        if min(float(s) for s in self.speed_levels) <= 0.0:
+            raise ValueError("speed_levels must all be positive")
+        if self.mouse_turn_max < self.mouse_turn_min:
+            raise ValueError("mouse_turn_max must be >= mouse_turn_min")
+        if not (self.mouse_turn_min <= self.mouse_turn_start
+                <= self.mouse_turn_max):
+            raise ValueError(
+                f"mouse_turn_start {self.mouse_turn_start} must lie between "
+                f"mouse_turn_min {self.mouse_turn_min} and mouse_turn_max "
+                f"{self.mouse_turn_max}")
         if self.focus_policy not in ("once", "always", "never"):
             raise ValueError(
                 f"focus_policy '{self.focus_policy}' is not one of "
@@ -340,8 +434,14 @@ class Config:
 
     @property
     def channels(self) -> int:
-        """Input channels the CNN sees: the grey stack plus one difference."""
+        """Input channels the model sees: the grey stack plus one difference."""
         return int(self.frame_stack) + 1
+
+    def frame_tokens(self) -> int:
+        """Patch tokens one frame becomes, given frame_size and patch_size."""
+        step = max(2, int(self.patch_size))
+        grid = max(1, (int(self.frame_size) + step - 1) // step)
+        return grid * grid
 
     def update_minibatches(self) -> int:
         """Minibatches per epoch, given the rollout and minibatch size."""
@@ -361,10 +461,15 @@ class Config:
         return asdict(self)
 
     def describe(self) -> str:
+        speeds = "/".join(f"{float(s):g}" for s in self.speed_levels)
         return (
             f"obs {self.frame_stack}x{self.frame_size}x{self.frame_size} grey "
             f"(+diff), repeat {self.action_repeat}, "
-            f"model {self.embed_dim}d/{self.hidden_dim}h, "
+            f"swiglu+rope transformer {self.embed_dim}d x "
+            f"{self.transformer_layers}L x {self.attention_heads}H "
+            f"(ffn {self.ffn_hidden}, window {self.mem_tokens} frames, "
+            f"{self.frame_tokens()} patch token(s)/frame), "
+            f"turn speed x[{speeds}] from a {self.mouse_turn_start}px base, "
             f"rollout {self.rollout_steps} x {self.epochs_per_update} epochs "
             f"in {self.minibatch_size}-step minibatches"
         )
@@ -372,11 +477,11 @@ class Config:
 
 # The shape of the checkpoint format. Bumped whenever a saved run stops being
 # loadable, so an incompatible file is refused instead of half-loaded.
-CHECKPOINT_VERSION = 2
+CHECKPOINT_VERSION = 3
 # Bumped whenever the reward function changes meaning. A checkpoint trained
 # against a different objective is refused, because resuming it would silently
 # continue a policy that was optimised for something else - which is exactly
 # how a run ends up babysitting a no-op policy.
-REWARD_VERSION = 2
+REWARD_VERSION = 3
 # Bumped when the model architecture changes in a way that invalidates weights.
-ARCH_NAME = "cnn-gru-v2"
+ARCH_NAME = "swiglu-rope-transformer-v1"

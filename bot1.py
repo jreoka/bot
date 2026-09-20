@@ -20,13 +20,19 @@ version of how it works:
   * It looks at the game window (grey frames plus a motion channel) and presses
     keys through a calibrated whitelist. No audio, no game-specific code, and no
     reading of a score.
-  * The policy is a small CNN plus a GRU - about 400k parameters - so a decision
-    costs a few milliseconds on a laptop CPU and the model never fights the game
-    for the machine.
+  * The policy is a single small SwiGLU + RoPE transformer over a rolling window
+    of frames - a couple of hundred thousand parameters - so a decision costs a
+    few milliseconds on a laptop CPU and the model never fights the game for the
+    machine. It is the only model in the process: the same network's next-frame
+    prediction is what the reward uses as curiosity, so there is no second
+    network to train, store or checkpoint.
+  * The bot sets its own mouse speed. Which way to swing is one decision and how
+    fast is another, and the base step behind them is the bot's own state: it
+    scales up when a turn does not move the view and down when it moves too far.
   * The reward is intrinsic: reaching states the bot has never reached since the
-    last reset, with a depth term so that pressing on is worth more than
-    standing still. Resets are inferred from the screen, because a death or a
-    respawn is not visible to a bot that knows nothing about the game.
+    last reset, plus how much better than usual it can predict what comes next.
+    Resets are inferred from the screen, because a death or a respawn is not
+    visible to a bot that knows nothing about the game.
   * Every loop has a hard budget and every memory has a cap, and the session
     prints a specific diagnosis when something has gone wrong - a frozen
     window, a policy that stopped pressing anything, an update that has grown

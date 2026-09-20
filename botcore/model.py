@@ -1,26 +1,46 @@
 """
 The model: how the bot sees, remembers, and decides.
 
-Shape of the whole thing:
+There is exactly one network here, and everything the bot does comes out of it:
 
-    frame  (C, S, S)  ->  CNN  ->  embed (E,)  ->  GRU  ->  heads
-                                              |
-                                              +-> novelty / forward model
+    frame stack (C, S, S) -> patch embedding -> tokens (N, E)
+                                                  |
+                            memory window (M, E) -+-> causal transformer
+                                                       (RoPE attention + SwiGLU)
+                                                              |
+                                        +---------------------+------------------+
+                                        |            |             |            |
+                                     held keys    turn dir     turn speed      tap
+                                        |            |             |            |
+                                    value head   next-frame prediction (curiosity)
 
-Why this and not a transformer over stacked frames: a transformer's cost grows
-with the square of the number of frames in its window, and every control step
-re-runs the whole window.  A CNN plus a recurrent state costs the same for one
-frame as for a hundred, because the state carries the history.  On a CPU that
-is the difference between a few milliseconds and a few hundred per step, and it
-is what makes this bot usable while the game is running.
+Every block is a SwiGLU feed-forward and a rotary-position causal
+self-attention.  Nothing else is consulted: there is no separate RND network and
+no separate forward model, because the transformer already predicts the next
+frame's representation as one of its own heads, and that prediction error is the
+curiosity signal.
 
-Everything here is deliberately small: around 400k parameters in total, which
-trains in well under a second per update on a laptop core.
+Why a window and not the whole history
+--------------------------------------
+A decoder-only transformer over everything the bot has ever seen would both cost
+more every step and never be trainable on a CPU.  What is kept instead is a
+rolling window of the last `mem_tokens` frame representations plus the tokens of
+the current frame, attended to causally.  The window is the transformer's memory;
+it holds the same kind of history a recurrent state would, it costs a fixed
+amount per step, and - unlike a hidden state - every PPO update can recompute it
+from the rollout exactly as it was during collection.
+
+Why the pattern is *causal*, and what that buys
+-----------------------------------------------
+The window in force at step t contains only frames from before t, so the decision
+at t cannot see the future.  At update time the stored window is used verbatim,
+which is what keeps the importance ratio in PPO meaningful: the same policy,
+the same inputs, the same log-probability.
 """
 
 from __future__ import annotations
 
-from typing import Tuple
+from typing import Dict, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -30,87 +50,260 @@ from .config import ARCH_NAME, Config
 
 
 # =============================================================================
-# Encoder
+# Building blocks
 # =============================================================================
 
-class FrameEncoder(nn.Module):
+class SwiGLU(nn.Module):
     """
-    (B, C, S, S) -> (B, embed_dim).
+    The gated feed-forward used by every block.
 
-    Strided convolutions and a fixed adaptive pool, so the output width does
-    not depend on the input resolution: changing frame_size does not change the
-    shape of anything downstream and does not invalidate the rest of the model.
+        SwiGLU(x) = W2( SiLU(W1 x) * W3 x )
+
+    Two projections where a plain MLP has one, which is why the hidden width is
+    kept to a small multiple of the embedding: the gating buys a lot of
+    expressiveness per parameter, and the multiply is nearly free compared with
+    the matmuls around it.
     """
 
-    def __init__(self, in_channels: int, width: int, embed_dim: int):
+    def __init__(self, dim: int, hidden: int):
         super().__init__()
-        w = int(width)
-        self.conv = nn.Sequential(
-            nn.Conv2d(in_channels, w, kernel_size=5, stride=2, padding=2),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(w, w * 2, kernel_size=3, stride=2, padding=1),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(w * 2, w * 2, kernel_size=3, stride=2, padding=1),
-            nn.ReLU(inplace=True),
-            nn.AdaptiveAvgPool2d((4, 4)),
-            nn.Flatten(),
-        )
-        self.proj = nn.Linear(w * 2 * 4 * 4, int(embed_dim))
-        self.norm = nn.LayerNorm(int(embed_dim))
-        for module in self.modules():
-            if isinstance(module, nn.Conv2d):
-                nn.init.kaiming_normal_(module.weight, nonlinearity="relu")
-                if module.bias is not None:
-                    nn.init.zeros_(module.bias)
-        nn.init.orthogonal_(self.proj.weight, gain=1.0)
-        nn.init.zeros_(self.proj.bias)
+        self.gate = nn.Linear(dim, hidden, bias=False)
+        self.up = nn.Linear(dim, hidden, bias=False)
+        self.down = nn.Linear(hidden, dim, bias=False)
+        nn.init.orthogonal_(self.gate.weight, gain=1.0)
+        nn.init.orthogonal_(self.up.weight, gain=1.0)
+        # The output projection starts small so a freshly initialised block is
+        # close to the identity: a transformer whose residual branches shout from
+        # the first step is one the critic never catches up with.
+        nn.init.orthogonal_(self.down.weight, gain=0.5)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.down(F.silu(self.gate(x)) * self.up(x))
+
+
+class RotaryEmbedding(nn.Module):
+    """
+    Rotary position embedding: rotates query/key pairs by an angle that depends
+    only on their *relative* distance.
+
+    That property is what makes the memory window work at all.  The window shifts
+    by one token every control step, so the absolute position of a given frame
+    changes constantly; with RoPE the attention score between two frames depends
+    on how far apart they are, not on where in the window they happen to sit.
+    """
+
+    def __init__(self, head_dim: int, max_tokens: int, base: float = 10000.0):
+        super().__init__()
+        # An even head width is required: the rotation is applied to pairs.
+        if head_dim % 2 == 1:
+            head_dim -= 1
+        self.head_dim = max(2, int(head_dim))
+        self.max_tokens = max(2, int(max_tokens))
+        self.base = float(base)
+        self._cache: Dict[tuple, torch.Tensor] = {}
+
+    def _angles(self, tokens: int, device, dtype) -> torch.Tensor:
+        key = (int(tokens), str(device), str(dtype))
+        cached = self._cache.get(key)
+        if cached is not None:
+            return cached
+        half = self.head_dim // 2
+        inv_freq = 1.0 / (self.base ** (torch.arange(half, device=device,
+                                                     dtype=torch.float32)
+                                        / max(1, half)))
+        positions = torch.arange(int(tokens), device=device, dtype=torch.float32)
+        angles = torch.outer(positions, inv_freq)          # (tokens, half)
+        cos = torch.cos(angles).to(dtype)
+        sin = torch.sin(angles).to(dtype)
+        # One entry is enough in practice (a handful of shapes), so the cache is
+        # bounded rather than growing with the run.
+        if len(self._cache) > 8:
+            self._cache.clear()
+        self._cache[key] = (cos, sin)
+        return cos, sin
+
+    @staticmethod
+    def _rotate(x: torch.Tensor) -> torch.Tensor:
+        """(..., half, 2) -> (..., half, 2) rotated by a quarter turn."""
+        first, second = x[..., 0], x[..., 1]
+        return torch.stack((-second, first), dim=-1)
+
+    def apply(self, x: torch.Tensor) -> torch.Tensor:
+        """x is (B, tokens, heads, head_dim) -> the same shape, rotated."""
+        tokens = int(x.shape[-3])
+        cos, sin = self._angles(tokens, x.device, x.dtype)
+        pairs = x.reshape(*x.shape[:-1], self.head_dim // 2, 2)
+        rotated = pairs * cos.view(1, tokens, 1, -1, 1) \
+            + self._rotate(pairs) * sin.view(1, tokens, 1, -1, 1)
+        out = rotated.reshape(*x.shape[:-1], self.head_dim)
+        # An odd head width has one dimension that cannot be paired; leave it
+        # alone rather than silently dropping it.
+        if out.shape[-1] != x.shape[-1]:
+            out = torch.cat([out, x[..., self.head_dim:]], dim=-1)
+        return out
+
+
+class CausalSelfAttention(nn.Module):
+    """Multi-head self-attention with a causal mask and rotary positions."""
+
+    def __init__(self, dim: int, heads: int, dropout: float = 0.0):
+        super().__init__()
+        self.heads = max(1, int(heads))
+        self.head_dim = max(2, int(dim) // self.heads)
+        inner = self.head_dim * self.heads
+        self.qkv = nn.Linear(dim, 3 * inner, bias=False)
+        self.out = nn.Linear(inner, dim, bias=False)
+        self.dropout = float(dropout)
+        nn.init.orthogonal_(self.qkv.weight, gain=1.0)
+        nn.init.orthogonal_(self.out.weight, gain=0.5)
+
+    def forward(self, x: torch.Tensor, rope: RotaryEmbedding,
+                mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+        batch, tokens, _dim = x.shape
+        qkv = self.qkv(x).reshape(batch, tokens, 3, self.heads, self.head_dim)
+        query, key, value = qkv.unbind(dim=2)
+        query = rope.apply(query)
+        key = rope.apply(key)
+        # (B, H, T, D) so the attention weights read naturally as T x T.
+        query = query.transpose(1, 2)
+        key = key.transpose(1, 2)
+        value = value.transpose(1, 2)
+        attended = F.scaled_dot_product_attention(
+            query, key, value, attn_mask=mask,
+            dropout_p=self.dropout if self.training else 0.0,
+            is_causal=mask is None)
+        attended = attended.transpose(1, 2).reshape(batch, tokens, -1)
+        return self.out(attended)
+
+
+class TransformerBlock(nn.Module):
+    """Pre-norm attention + SwiGLU, both residual."""
+
+    def __init__(self, dim: int, heads: int, ffn_hidden: int,
+                 dropout: float = 0.0):
+        super().__init__()
+        self.attn_norm = nn.LayerNorm(dim)
+        self.attn = CausalSelfAttention(dim, heads, dropout)
+        self.ffn_norm = nn.LayerNorm(dim)
+        self.ffn = SwiGLU(dim, ffn_hidden)
+
+    def forward(self, x: torch.Tensor, rope: RotaryEmbedding,
+                mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+        x = x + self.attn(self.attn_norm(x), rope, mask)
+        x = x + self.ffn(self.ffn_norm(x))
+        return x
+
+
+# =============================================================================
+# Encoder: frame stack -> patch tokens
+# =============================================================================
+
+class PatchEmbedding(nn.Module):
+    """
+    (B, C, S, S) -> (B, tokens, embed_dim).
+
+    One strided convolution and nothing else: the transformer does the sequence
+    work, so this only has to turn pixels into vectors.  It is deliberately not
+    a deep conv stack - a hierarchy of convolutions in front of the transformer
+    would mean two models, and the point of this build is that there is one.
+    """
+
+    def __init__(self, in_channels: int, embed_dim: int, frame_size: int,
+                 patch: int, width: int):
+        super().__init__()
+        patch = max(2, int(patch))
+        self.patch = patch
+        self.grid = max(1, (int(frame_size) + patch - 1) // patch)
+        self.tokens = self.grid * self.grid
+        self.proj = nn.Conv2d(int(in_channels), int(width), kernel_size=patch,
+                              stride=patch, bias=True)
+        self.norm = nn.LayerNorm(int(width))
+        self.out = nn.Linear(int(width), int(embed_dim), bias=False)
+        nn.init.kaiming_normal_(self.proj.weight, nonlinearity="relu")
+        if self.proj.bias is not None:
+            nn.init.zeros_(self.proj.bias)
+        nn.init.orthogonal_(self.out.weight, gain=1.0)
 
     def forward(self, frames: torch.Tensor) -> torch.Tensor:
-        return self.norm(self.proj(self.conv(frames)))
+        size = int(frames.shape[-1])
+        if size % self.patch != 0:
+            # Pad once at the edge rather than re-deriving the grid: the token
+            # count downstream must stay fixed for a fixed frame_size.
+            pad = self.patch - (size % self.patch)
+            frames = F.pad(frames, (0, pad, 0, pad))
+        patches = self.proj(frames)
+        patches = patches.flatten(2).transpose(1, 2)        # (B, tokens, width)
+        return self.out(F.silu(self.norm(patches)))
 
 
 # =============================================================================
-# Policy: GRU + factored heads
+# Policy: one transformer, every head
 # =============================================================================
 
 class ActorCritic(nn.Module):
     """
-    Recurrent policy with three independent decision heads.
+    The whole bot: a SwiGLU + RoPE causal transformer over a memory window, and
+    the heads that read its last position.
 
-    The held-key head is a set of independent Bernoulli bits with a top-k
-    constraint, not a softmax over combinations.  Two reasons: the number of
-    combinations of eleven keys is 2048 and the bot would never explore it, and
-    a Bernoulli factorisation lets the useful sub-decisions (walk, and also
-    sprint) be learned separately and then combined at sample time - which is
-    exactly what a player does.
+    Decisions are factored the way a player's are:
 
-    ``sample`` and ``sequence_log_prob`` must agree exactly, because PPO
-    compares the two.  Both apply the same top-k rule, so they do.
+        held keys   - independent Bernoulli bits under a top-k cap
+        turn        - which way to swing the view
+        turn speed  - how far, as a multiple of the step size the bot keeps for
+                      itself (this is the mouse speed, and the bot owns it; see
+                      `mouse_step`)
+        tap/click   - one momentary button
+
+    ``sample`` and ``sequence_log_prob`` must agree exactly, because PPO compares
+    the two.  They share every distribution: the capped key-set distribution, and
+    the same categorical heads.
     """
 
-    def __init__(self, cfg: Config, head_sizes: Tuple[int, int, int],
+    def __init__(self, cfg: Config, head_sizes: Tuple[int, int, int, int],
                  observation_channels: int):
         super().__init__()
         self.cfg = cfg
         self.arch = ARCH_NAME
         self.head_sizes = tuple(int(h) for h in head_sizes)
-        self.n_hold, self.n_turn, self.n_tap = self.head_sizes
+        self.n_hold, self.n_turn, self.n_speed, self.n_tap = self.head_sizes
         self.n_keys = max(1, self.n_hold - 1)
         self.max_held = max(1, min(int(cfg.max_held_keys), self.n_keys))
 
-        self.encoder = FrameEncoder(observation_channels, cfg.cnn_width,
-                                    cfg.embed_dim)
-        self.gru = nn.GRUCell(int(cfg.embed_dim), int(cfg.hidden_dim))
+        self.embed_dim = int(cfg.embed_dim)
+        self.mem_tokens = max(1, int(cfg.mem_tokens))
+        self.patch = max(2, int(cfg.patch_size))
+        self.patch_embed = PatchEmbedding(
+            int(observation_channels), self.embed_dim, int(cfg.frame_size),
+            self.patch, int(cfg.patch_width))
+        self.frame_tokens = int(self.patch_embed.tokens)
 
-        h = int(cfg.hidden_dim)
+        # The memory slot for a step that has not happened yet. Learned, so the
+        # model can decide for itself what "the start of a run" looks like.
+        self.bos = nn.Parameter(torch.zeros(1, 1, self.embed_dim))
+        nn.init.normal_(self.bos, std=0.02)
+
+        self.blocks = nn.ModuleList([
+            TransformerBlock(self.embed_dim, int(cfg.attention_heads),
+                             int(cfg.ffn_hidden), float(cfg.attention_dropout))
+            for _ in range(max(1, int(cfg.transformer_layers)))
+        ])
+        self.rope = RotaryEmbedding(self.embed_dim // max(
+            1, int(cfg.attention_heads)),
+            self.mem_tokens + self.frame_tokens + 2)
+
+        self.final_norm = nn.LayerNorm(self.embed_dim)
+
+        h = self.embed_dim
         self.hold_head = nn.Linear(h, self.n_keys)
         self.turn_head = nn.Linear(h, self.n_turn)
+        self.speed_head = nn.Linear(h, self.n_speed)
         self.tap_head = nn.Linear(h, self.n_tap)
         self.value_head = nn.Linear(h, 1)
 
         # A near-uniform start for the decisions: a policy that begins already
         # certain of one action never explores its way out of it.
-        for head in (self.hold_head, self.turn_head, self.tap_head):
+        for head in (self.hold_head, self.turn_head, self.speed_head,
+                     self.tap_head):
             nn.init.orthogonal_(head.weight, gain=0.01)
             nn.init.zeros_(head.bias)
         # The held-key head starts biased *against* pressing, so the keys a
@@ -123,10 +316,75 @@ class ActorCritic(nn.Module):
         nn.init.orthogonal_(self.value_head.weight, gain=1.0)
         nn.init.zeros_(self.value_head.bias)
 
+        # ---- the bot's own mouse speed ----
+        #
+        # One pixel step the bot keeps for itself, in *world* pixels per unit of
+        # speed.  It is a buffer rather than a parameter because it lives outside
+        # the differentiable graph: the policy says "turn left at speed 2x" and
+        # this says what 1x is worth, which is exactly the kind of quantity a
+        # learner should be allowed to move on its own.  `set_mouse_step` pins it
+        # when the user knows better (--mouse-turn, or a --calibrate recording).
+        self.register_buffer("mouse_step",
+                             torch.tensor([float(max(1, cfg.mouse_turn_start))],
+                                          dtype=torch.float32))
+        self.mouse_step_min = float(max(1, cfg.mouse_turn_min))
+        self.mouse_step_max = float(max(self.mouse_step_min,
+                                        cfg.mouse_turn_max))
+
+        # ---- the curiosity head ----
+        #
+        # Predicts the *next* frame's representation. Its error is the novelty
+        # signal the reward is built from, so there is no second network to
+        # train, store or checkpoint. The input is detached: the reward signal
+        # must not be able to change the policy's features to make itself look
+        # better.
+        self.transition_norm = nn.LayerNorm(h)
+        self.transition = nn.Sequential(
+            nn.Linear(h, int(cfg.transition_hidden)), nn.SiLU(),
+            nn.Linear(int(cfg.transition_hidden), self.embed_dim),
+        )
+        nn.init.orthogonal_(self.transition[0].weight, gain=1.0)
+        nn.init.zeros_(self.transition[0].bias)
+        nn.init.orthogonal_(self.transition[2].weight, gain=0.5)
+        nn.init.zeros_(self.transition[2].bias)
+        self.transition_optimizer = torch.optim.Adam(
+            list(self.transition.parameters())
+            + list(self.transition_norm.parameters()),
+            lr=float(cfg.transition_lr))
+
+    # ---- mouse speed ----
+    def mouse_step_value(self) -> int:
+        """Pixels per 1x turn step, as an integer, for the input layer."""
+        return max(1, int(round(float(self.mouse_step.item()))))
+
+    @torch.no_grad()
+    def set_mouse_step(self, pixels: Optional[float]) -> None:
+        """Pin the base turn step (the user knows the game better than we do)."""
+        if pixels is None:
+            return
+        value = float(pixels)
+        if value <= 0:
+            return
+        self.mouse_step.fill_(min(max(value, self.mouse_step_min),
+                                  self.mouse_step_max))
+
+    @torch.no_grad()
+    def nudge_mouse_step(self, factor: float) -> None:
+        """
+        Move the base turn step, staying inside the configured bounds.
+
+        Used by the session's speed correction: when turns repeatedly fail to
+        move the picture, this is the knob that closes the gap. Bounded on both
+        ends so a bad estimate cannot turn a small correction into a spin.
+        """
+        value = float(self.mouse_step.item()) * float(factor)
+        self.mouse_step.fill_(min(max(value, self.mouse_step_min),
+                                  self.mouse_step_max))
+
     # ---- the held-key decision ----
     #
     # The held-key head is a set of independent Bernoulli bits, conditioned on
-    # at most `max_held` of them being set.  Why independent bits rather than a
+    # at most `max_held` of them being set. Why independent bits rather than a
     # softmax over combinations:
     #
     #   * There are 2**11 combinations. A softmax over them can never be
@@ -157,28 +415,6 @@ class ActorCritic(nn.Module):
         # and scoring cannot drift apart again.
         return bits, self.held_log_prob(logits, bits)
 
-    # ---- the distribution the log-probabilities are taken under -----------
-    #
-    # Sampling and scoring *must* be the same distribution, because PPO divides
-    # one by the other. They were not: the sampler drew independent Bernoulli
-    # bits and then silently dropped keys past the cap, while the update scored
-    # the surviving bits as if they had been drawn from those Bernoullis
-    # directly. Any step where the cap fired recorded a log-probability the
-    # update could not reproduce - measured at up to ~6 nats, a ratio of 400 -
-    # so every update was dominated by a truncation artefact instead of by
-    # advantage. The symptoms were a fitted KL near -1.2, three quarters of
-    # samples outside the trust region, an explained variance of -10^4, and a
-    # policy that never moved.
-    #
-    # The fix is one distribution used by both paths:
-    #
-    #     P(mask) is proportional to prod_{i in mask} p_i * prod_{i not in mask} (1 - p_i)
-    #     ... restricted to |mask| <= max_held, renormalised over the kept masks.
-    #
-    # which is "independent bits, conditioned on holding at most k keys".  It is
-    # what the sampler always meant to draw from, it is exact, and it can be
-    # scored cheaply by enumerating the kept masks: C(9, <=4) = 256 of them for
-    # a nine-key whitelist.
     def _held_categories(self, logits: torch.Tensor) -> torch.Tensor:
         """Every key-mask with at most ``max_held`` bits set, as (n_cat, n_keys)."""
         n_keys = int(logits.shape[-1])
@@ -256,64 +492,150 @@ class ActorCritic(nn.Module):
 
     # ---- forward paths ----
     def encode(self, frames: torch.Tensor) -> torch.Tensor:
-        return self.encoder(frames)
+        """Frame stack -> patch tokens."""
+        return self.patch_embed(frames)
 
-    def heads(self, hidden: torch.Tensor):
-        return (self.hold_head(hidden), self.turn_head(hidden),
-                self.tap_head(hidden), self.value_head(hidden).squeeze(-1))
+    def initial_hidden(self, batch: int, device) -> torch.Tensor:
+        """The memory window at the start of a run: every slot is the BOS token."""
+        return self.bos.detach().expand(int(batch), self.mem_tokens,
+                                        self.embed_dim).clone().to(device)
+
+    def advance(self, hidden: torch.Tensor,
+                tokens: torch.Tensor) -> torch.Tensor:
+        """
+        Push one step's frame tokens into the window.
+
+        The window is appended to and rolled; the new step's representation is
+        the mean of its own tokens, which is what the next step will attend to.
+        Rolling rather than growing is what keeps the per-step cost flat.
+        """
+        summary = tokens.mean(dim=-2, keepdim=True)
+        return torch.cat([hidden, summary], dim=-2)[..., -self.mem_tokens:, :]
+
+    def forward(self, hidden: torch.Tensor, tokens: torch.Tensor
+                ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        Run the transformer over the memory window plus this step's tokens.
+
+        ``hidden`` is (..., M, E) and ``tokens`` is (..., N, E).  Returns
+        (new_hidden, context, features):
+
+        * ``new_hidden`` is the window for the *next* step, with the mean of
+          this step's tokens appended (see `advance`);
+        * ``context`` is the pooled representation of the window, used for the
+          value estimate and the transition head;
+        * ``features`` is the last position's output, which is what the decision
+          heads read: it has attended to every frame token just encoded.
+
+        ``hidden`` may carry leading batch dimensions (the PPO update passes
+        (T, B, M, E)); those are folded into one attention batch, because the
+        window of one step of one sequence must never see another's.
+        """
+        window = self.advance(hidden, tokens)                 # (..., M + 1, E)
+        leading = window.shape[:-2]
+        rows = 1
+        for size in leading:
+            rows *= int(size)
+        dim = int(window.shape[-1])
+        frame_tokens = int(tokens.shape[-2])
+        seq = torch.cat([window, tokens], dim=-2)             # (..., M+1+N, E)
+        total = int(seq.shape[-2])
+        flat = seq.reshape(rows, total, dim)
+        # Causal: a frame may only see itself and what came before it.
+        mask = torch.ones(total, total, dtype=torch.bool,
+                          device=seq.device).tril()
+        x = flat
+        for block in self.blocks:
+            x = block(x, self.rope, mask)
+        x = self.final_norm(x)
+        x = x.reshape(*leading, total, dim)
+        context = x[..., :-frame_tokens, :].mean(dim=-2)
+        features = x[..., -1, :]
+        return window, context, features
+
+    def heads(self, features: torch.Tensor, context: torch.Tensor):
+        """Every decision head, plus the value, from one forward pass."""
+        return (self.hold_head(features), self.turn_head(features),
+                self.speed_head(features), self.tap_head(features),
+                self.value_head(context).squeeze(-1))
+
+    def predict_next(self, context: torch.Tensor) -> torch.Tensor:
+        """The curiosity head: what the next frame's representation should be."""
+        return self.transition(self.transition_norm(context.detach()))
 
     @torch.no_grad()
     def step(self, obs: torch.Tensor, hidden: torch.Tensor):
         """
-        One control step: (1, C, S, S) and the previous hidden state in.
+        One control step: (1, C, S, S) and the memory window in.
 
         Returns the sampled decision, its log-probability, the value estimate,
-        the new hidden state, and the frame embedding (reused by the novelty
-        and forward-model heads, so the encoder only runs once per step).
+        the window for the next step, the pooled context (reused by the
+        curiosity head), and this frame's token summary (which is what the next
+        step's transition error is measured against).
         """
-        embed = self.encode(obs)
-        hidden = self.gru(embed, hidden)
-        hold_logits, turn_logits, tap_logits, value = self.heads(hidden)
+        tokens = self.encode(obs)
+        new_hidden, context, features = self.forward(hidden, tokens)
+        hold_logits, turn_logits, speed_logits, tap_logits, value = \
+            self.heads(features, context)
 
         bits, log_prob = self.sample_held(hold_logits)
         # No post-hoc truncation here: the cap is already part of the
         # distribution `sample_held` drew from, so the action needs no edit and
         # its log-probability is exactly the one the update will recompute.
         turn_dist = torch.distributions.Categorical(logits=turn_logits)
+        speed_dist = torch.distributions.Categorical(logits=speed_logits)
         tap_dist = torch.distributions.Categorical(logits=tap_logits)
-        turn = turn_dist.sample()
+        direction = turn_dist.sample()
+        speed = speed_dist.sample()
         tap = tap_dist.sample()
-        log_prob = (log_prob + turn_dist.log_prob(turn)
-                    + tap_dist.log_prob(tap))
-        return (bits, turn, tap), log_prob, value, hidden, embed
+        log_prob = (log_prob + turn_dist.log_prob(direction)
+                    + speed_dist.log_prob(speed) + tap_dist.log_prob(tap))
+        summary = tokens.mean(dim=-2)
+        return ((bits, direction, speed, tap), log_prob, value, new_hidden,
+                context, summary)
 
-    def sequence_log_prob(self, hidden: torch.Tensor,
-                          held: torch.Tensor, turn: torch.Tensor,
-                          tap: torch.Tensor):
+    def value_only(self, obs: torch.Tensor, hidden: torch.Tensor
+                   ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Value of an observation given the window - the GAE bootstrap."""
+        tokens = self.encode(obs)
+        new_hidden, context, features = self.forward(hidden, tokens)
+        _h, _t, _s, _a, value = self.heads(features, context)
+        return value, new_hidden
+
+    def sequence_log_prob(self, hidden: torch.Tensor, summary: torch.Tensor,
+                          held: torch.Tensor, direction: torch.Tensor,
+                          speed: torch.Tensor, tap: torch.Tensor):
         """
         Score a recorded sequence under the current policy.
 
-        ``hidden`` is (T, B, H) - the recurrent state *before* each step,
-        exactly as it was during collection.  Recomputing the states instead of
-        storing them would make the update off-policy against the policy that
-        produced the data, which is the classic recurrent-PPO trap; storing one
-        small vector per step avoids it for a few hundred bytes a step.
+        ``hidden`` is (T, B, M, E) - the memory window *before* each step,
+        exactly as it was during collection - and ``summary`` is (T, B, E), the
+        representation of the frame that step saw.  The frame is rebuilt from its
+        stored summary rather than re-encoded, so the transformer reads the same
+        input in both paths and the same computation is scored as was sampled.
+        Recomputing the window instead of storing it would make the update
+        off-policy against the policy that produced the data, which is the
+        classic recurrent-PPO trap; storing one window per step costs a few
+        hundred kilobytes per rollout and removes the problem.
         """
-        hold_logits, turn_logits, tap_logits, value = self.heads(hidden)
+        tokens = summary.unsqueeze(-2)
+        _window, context, features = self.forward(hidden, tokens)
+        hold_logits, turn_logits, speed_logits, tap_logits, value = \
+            self.heads(features, context)
         log_prob = self.held_log_prob(hold_logits, held)
         turn_dist = torch.distributions.Categorical(logits=turn_logits)
+        speed_dist = torch.distributions.Categorical(logits=speed_logits)
         tap_dist = torch.distributions.Categorical(logits=tap_logits)
-        log_prob = log_prob + turn_dist.log_prob(turn) + tap_dist.log_prob(tap)
+        log_prob = (log_prob + turn_dist.log_prob(direction)
+                    + speed_dist.log_prob(speed) + tap_dist.log_prob(tap))
         entropy = (self.held_entropy(hold_logits)
-                   + turn_dist.entropy() + tap_dist.entropy())
-        return log_prob, entropy, value
-
-    def initial_hidden(self, batch: int, device) -> torch.Tensor:
-        return torch.zeros(batch, int(self.cfg.hidden_dim), device=device)
+                   + turn_dist.entropy() + speed_dist.entropy()
+                   + tap_dist.entropy())
+        return log_prob, entropy, value, context
 
 
 # =============================================================================
-# Intrinsic-reward networks
+# Reward-side statistics
 # =============================================================================
 
 class RunningScale:
@@ -358,143 +680,3 @@ class RunningScale:
     def load(self, state) -> None:
         self.mean, self.var, self.count = (float(state[0]), float(state[1]),
                                            int(state[2]))
-
-
-class RandomNetworkDistillation(nn.Module):
-    """
-    RND: a predictor tries to match a fixed randomly-initialised network.
-
-    Prediction error is high where the bot has seen little and low where it has
-    seen a lot, which is a per-state novelty signal that needs no visit counts
-    and no discretisation.  The predictor is trained online with plain SGD - a
-    two-layer MLP does not need an adaptive optimiser, and this keeps its cost
-    and memory flat forever.
-    """
-
-    def __init__(self, in_dim: int, hidden: int, out_dim: int, lr: float):
-        super().__init__()
-        self.target = nn.Sequential(
-            nn.Linear(in_dim, hidden), nn.ReLU(),
-            nn.Linear(hidden, hidden), nn.ReLU(),
-            nn.Linear(hidden, out_dim),
-        )
-        for param in self.target.parameters():
-            param.requires_grad_(False)
-        self.predictor = nn.Sequential(
-            nn.Linear(in_dim, hidden), nn.ReLU(),
-            nn.Linear(hidden, hidden), nn.ReLU(),
-            nn.Linear(hidden, out_dim),
-        )
-        self.optimizer = torch.optim.SGD(self.predictor.parameters(), lr=float(lr))
-        self.scale = RunningScale()
-        self.last_error = 0.0
-        self.last_novelty = 0.0
-
-    def forward(self, x: torch.Tensor, train: bool = True) -> torch.Tensor:
-        with torch.no_grad():
-            target = self.target(x)
-        if not train:
-            # Only the error is wanted; do not build a graph for it.
-            with torch.no_grad():
-                error = F.mse_loss(self.predictor(x), target)
-            value = float(error)
-            self.last_error = value
-            self.scale.update(value)
-            return error
-        prediction = self.predictor(x)
-        error = F.mse_loss(prediction, target)
-        value = float(error.detach())
-        self.last_error = value
-        self.scale.update(value)
-        self.optimizer.zero_grad(set_to_none=True)
-        error.backward()
-        self.optimizer.step()
-        return error.detach()
-
-    def novelty(self, x: torch.Tensor, train: bool = False) -> float:
-        """Scaled novelty: about 1.0 when this state is as new as usual."""
-        error = float(self(x, train=train))
-        self.last_novelty = error / self.scale.std
-        return self.last_novelty
-
-    def train_batch(self, x: torch.Tensor, steps: int = 1) -> float:
-        """A few gradient steps on a batch, run during the PPO update."""
-        loss_value = 0.0
-        for _ in range(max(1, int(steps))):
-            with torch.no_grad():
-                target = self.target(x)
-            prediction = self.predictor(x)
-            error = F.mse_loss(prediction, target)
-            self.optimizer.zero_grad(set_to_none=True)
-            error.backward()
-            self.optimizer.step()
-            loss_value = float(error.detach())
-        return loss_value
-
-
-class ForwardModel(nn.Module):
-    """
-    Predicts the next frame embedding from the current one and the action.
-
-    Two things come out of it:
-
-    * **learning progress** - how much better this episode is going than
-      previous episodes were, measured on the model's own prediction error.
-      Paying for improvement rather than for error is what stops the bot from
-      parking in front of the most chaotic thing it can find: once it
-      understands a region, the error there stops paying.  This is the term
-      that turns "wander around" into "work out what this part of the game
-      does", and it is measured across whole episodes because a within-episode
-      average just tracks recent noise and pays out forever.
-
-    * **liveness** - a prediction error that suddenly jumps means the world
-      changed in a way this model cannot account for.  The reset detector uses
-      that, alongside the raw frame difference.
-    """
-
-    def __init__(self, embed_dim: int, action_dim: int, hidden: int, lr: float):
-        super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(embed_dim + action_dim, hidden), nn.ReLU(),
-            nn.Linear(hidden, hidden), nn.ReLU(),
-            nn.Linear(hidden, embed_dim),
-        )
-        self.optimizer = torch.optim.SGD(self.net.parameters(), lr=float(lr))
-        self.scale = RunningScale()
-        self.last_error = 0.0
-
-    def forward(self, embed: torch.Tensor, action: torch.Tensor,
-                next_embed: torch.Tensor, train: bool = True) -> float:
-        prediction = self.net(torch.cat([embed, action], dim=-1))
-        error = F.mse_loss(prediction, next_embed)
-        value = float(error.detach())
-        self.last_error = value
-        self.scale.update(value)
-        if train:
-            self.optimizer.zero_grad(set_to_none=True)
-            error.backward()
-            self.optimizer.step()
-        return value
-
-    def error_only(self, embed: torch.Tensor, action: torch.Tensor,
-                   next_embed: torch.Tensor) -> float:
-        """Prediction error without a gradient step, for use inside the loop."""
-        with torch.no_grad():
-            prediction = self.net(torch.cat([embed, action], dim=-1))
-            error = F.mse_loss(prediction, next_embed)
-        value = float(error)
-        self.last_error = value
-        self.scale.update(value)
-        return value
-
-    def train_batch(self, embed: torch.Tensor, action: torch.Tensor,
-                    next_embed: torch.Tensor, steps: int = 1) -> float:
-        loss_value = 0.0
-        for _ in range(max(1, int(steps))):
-            prediction = self.net(torch.cat([embed, action], dim=-1))
-            error = F.mse_loss(prediction, next_embed)
-            self.optimizer.zero_grad(set_to_none=True)
-            error.backward()
-            self.optimizer.step()
-            loss_value = float(error.detach())
-        return loss_value

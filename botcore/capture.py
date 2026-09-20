@@ -687,9 +687,9 @@ class FrameStack:
         channels [0 .. n-1]  the last n frames, oldest first, as grayscale
         channel  n           |newest - oldest|, a motion/change channel
 
-    The difference channel costs a subtraction, and it is what lets a small
-    network see motion without needing a recurrent pass over the pixels or a
-    stack long enough to infer it from per-frame appearance alone.
+    The difference channel costs a subtraction, and it is what lets the model
+    see motion without having to infer it from per-frame appearance alone, or
+    from a stack long enough to make the motion obvious.
     """
 
     def __init__(self, size: int, stack: int):

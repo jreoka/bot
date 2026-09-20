@@ -298,9 +298,10 @@ def greedy_action(policy, observation: np.ndarray, hidden, device,
     with torch.no_grad():
         obs = torch.as_tensor(observation, dtype=torch.float32,
                               device=device).unsqueeze(0)
-        embed = policy.encode(obs)
-        hidden = policy.gru(embed, hidden)
-        hold_logits, turn_logits, tap_logits, _value = policy.heads(hidden)
+        tokens = policy.encode(obs)
+        window, context, features = policy.forward(hidden, tokens)
+        hold_logits, turn_logits, speed_logits, tap_logits, _value = \
+            policy.heads(features, context)
 
     logits = hold_logits.squeeze(0)
     probabilities = torch.sigmoid(logits)
@@ -315,11 +316,18 @@ def greedy_action(policy, observation: np.ndarray, hidden, device,
         order = torch.argsort(logits, descending=True)[:k]
         for index in order.tolist():
             mask |= 1 << int(index)
+    # The synthetic world only understands left/right/no-turn, so the four
+    # directional choices are collapsed onto it. The speed choice is not part of
+    # the synthetic world at all, which is the honest arrangement: that game has
+    # no view to swing, so there is nothing for a speed to mean there.
+    direction = int(torch.argmax(turn_logits, dim=-1).item())
+    turn = 1 if direction == 1 else (2 if direction == 2 else 0)
     action = {"held_mask": int(mask),
-              "turn_index": int(torch.argmax(turn_logits, dim=-1).item()),
+              "turn_index": turn,
+              "speed_index": int(torch.argmax(speed_logits, dim=-1).item()),
               "tap_index": int(torch.argmax(tap_logits, dim=-1).item()),
               "held_vks": [], "turn": (0, 0), "tap_vk": 0}
-    return action, hidden
+    return action, window
 
 
 def evaluate(policy, env, device, episodes: int = 5, max_steps: int = 200
@@ -356,6 +364,14 @@ def _synthetic_train_config(cfg: Config, frame_size: int,
         rollout_steps=int(rollout_steps),
         minibatch_size=256,
         epochs_per_update=4,
+        # A shorter memory window than the shipped default: the synthetic games
+        # are decided by the last handful of frames, and the self-test is worth
+        # more when it finishes in minutes than when it is marginally better.
+        mem_tokens=8,
+        # The synthetic games have no view to swing, so there is nothing for a
+        # mouse-speed correction to measure; leaving it on would walk the base
+        # step to its ceiling for no reason.
+        mouse_adapt_rate=0.0,
         target_fps=0.0,
         enable_hotkeys=False,
         torch_threads=int(cfg.torch_threads),
@@ -382,7 +398,7 @@ def _synthetic_action_space(cfg: Config):
     keymap.vks = {"W": 0x57, "S": 0x53, "D": 0x44}
     return ActionSpace.build(
         keymap, max_held=cfg.max_held_keys,
-        turn_levels=(("normal", 1.0), ("fast", 2.0)),
+        speed_levels=cfg.speed_levels,
         include_mouse_taps=False)
 
 
@@ -408,8 +424,8 @@ def random_baseline(env, max_held: int, episodes: int = 5,
                     mask |= 1 << index
             turn = int(rng.integers(0, 3))
             observation, done, info = env.step(
-                {"held_mask": mask, "turn_index": turn, "tap_index": 0,
-                 "held_vks": [], "turn": (0, 0), "tap_vk": 0})
+                {"held_mask": mask, "turn_index": turn, "speed_index": 0,
+                 "tap_index": 0, "held_vks": [], "turn": (0, 0), "tap_vk": 0})
             cells.append(int(info.get("cell", 0)))
             if done or info.get("died"):
                 break
@@ -541,7 +557,7 @@ def run_learning_check(verbose: bool = True, seed: int = 0,
         session = GameSession(cfg, env_, _synthetic_action_space(cfg))
         session.reset(seed=seed)
         # One bit at a time, so "forward" really means forward.
-        action = (np.zeros(3, dtype=np.float32), 0, 0)
+        action = (np.zeros(3, dtype=np.float32), 0, 0, 0)
         if mask:
             action[0][int(np.log2(mask))] = 1.0
         total = 0.0

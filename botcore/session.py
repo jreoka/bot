@@ -164,9 +164,21 @@ class GameSession:
             self.cfg, self.device, action_space.action_vector_size)
         self.trainer = Trainer(self.cfg, self.policy, self.device)
         self.buffer = RolloutBuffer(
-            self.cfg.rollout_steps, self.cfg.embed_dim, self.cfg.hidden_dim,
+            self.cfg.rollout_steps, self.cfg.embed_dim, self.cfg.mem_tokens,
             len(action_space.hold_vks), self.device)
         self.health = HealthMonitor(self.cfg)
+
+        # The view depth the bot starts from. --calibrate measures it, and
+        # --mouse-turn pins it; either way the bot is free to move it inside the
+        # configured bounds afterwards, because the only thing that knows how
+        # far this game's view really turns is the game.
+        if keymap is not None:
+            self.policy.set_mouse_step(float(
+                min(max(int(keymap.default_mouse_turn),
+                        int(self.cfg.mouse_turn_min)),
+                    int(self.cfg.mouse_turn_max))))
+        if self.cfg.mouse_turn_pixels:
+            self.policy.set_mouse_step(float(self.cfg.mouse_turn_pixels))
 
         # Running performance split, which is what the [Perf] line reports.
         self.env_seconds = 0.0
@@ -187,9 +199,20 @@ class GameSession:
         self._action_counts: Dict[str, int] = defaultdict(int)
         self._alerted_no_delivery = False
         self._alerted_non_game = False
-        self._pending_previous_embed = np.zeros(self.cfg.embed_dim,
-                                                dtype=np.float32)
-        self._pending_embed = np.zeros(self.cfg.embed_dim, dtype=np.float32)
+        self._pending_summary = np.zeros(self.cfg.embed_dim, dtype=np.float32)
+        self._pending_prediction = np.zeros(self.cfg.embed_dim,
+                                            dtype=np.float32)
+        self._pending_context = np.zeros(self.cfg.embed_dim, dtype=np.float32)
+        self._pending_window = self.hidden.squeeze(0).cpu().numpy().copy()
+        # A prediction is only meaningful once a *previous* decision has made
+        # one; see `decide`.
+        self._pending_has_prediction = False
+        # How many turns the bot has taken, how many of them it could actually
+        # see change the picture, and the recent history the correction in
+        # `_note_turn` is gated on.
+        self._turn_decisions = 0
+        self._turn_observations = 0
+        self._turn_window: Deque[int] = deque(maxlen=20)
 
         if self.cfg.log_json:
             os.makedirs(os.path.dirname(os.path.abspath(self.cfg.log_json))
@@ -220,31 +243,44 @@ class GameSession:
         if not keep_rollout:
             self.buffer.reset()
             self.last_value = 0.0
-        self._pending_previous_embed = np.zeros(self.cfg.embed_dim,
-                                                dtype=np.float32)
+        self._pending_summary = np.zeros(self.cfg.embed_dim, dtype=np.float32)
+        self._pending_prediction = np.zeros(self.cfg.embed_dim,
+                                            dtype=np.float32)
+        self._pending_has_prediction = False
         self.decide()
         return observation
 
-    def decide(self) -> Tuple[np.ndarray, int, int]:
+    def decide(self) -> Tuple[np.ndarray, int, int, int]:
         """
         Choose an action for the current observation.
 
         Everything the later stages need is stashed here: the log-probability
-        and value of the decision, the hidden state that was in force *before*
-        it (which is what the recurrent PPO update needs), and the frame
-        embedding, so the reward nets never re-run the encoder.
+        and value of the decision, the memory window that was in force *before*
+        it (which is what the transformer PPO update needs), the pooled context
+        and this frame's summary (which the curiosity head works from), and the
+        model's prediction of the *next* frame, so the reward at the next step
+        can score it without another forward pass.
         """
-        action, log_prob, value, new_hidden, embed, previous_hidden = \
+        action, log_prob, value, new_hidden, context, summary, previous = \
             self.trainer.act(self.observation, self.hidden)
         self._pending_log_prob = log_prob
         self._pending_value = value
-        self._pending_hidden = previous_hidden
-        # The previous frame's embedding is what the forward model needs to
-        # predict this one from. Reusing the one stored last step is exact and
-        # free; the encoder never runs twice for the same frame.
-        self._pending_previous_embed = self._pending_embed
-        self._pending_embed = embed
+        self._pending_window = previous
+        self._pending_summary = summary
+        self._pending_context = context
         self.hidden = new_hidden
+        # What this frame says the next frame should look like. The reward
+        # compares it against the real thing one step later; see
+        # IntrinsicReward.compute.
+        context_tensor = torch.as_tensor(context, dtype=torch.float32,
+                                         device=self.device).unsqueeze(0)
+        with torch.no_grad():
+            self._pending_prediction = self.policy.predict_next(
+                context_tensor).squeeze(0).cpu().numpy()
+        # Only now is there a prediction to score against the next frame: the
+        # first decision of a run (and the first after a reset window change)
+        # has no predecessor to have predicted it.
+        self._pending_has_prediction = True
         return action
 
     @property
@@ -255,25 +291,29 @@ class GameSession:
         """Virtual keys currently held by the bot (for release on shutdown)."""
         return list(self._held_vks)
 
-    def action_for_env(self, action: Tuple[np.ndarray, int, int]) -> Dict:
+    def action_for_env(self, action: Tuple[np.ndarray, int, int, int]) -> Dict:
         """
         Translate a factored decision into something an environment can apply.
 
-        A dict rather than three parallel arguments, because the two consumers
-        want different things from it: the real game wants the keys and the
-        pixel delta, the synthetic game wants a flat index.
+        A dict rather than parallel arguments, because the two consumers want
+        different things from it: the real game wants the keys and the pixel
+        delta, the synthetic game wants a flat index.
+
+        The pixel delta is computed here, from the bot's *current* mouse step,
+        which is the part of the speed decision the bot owns (see
+        `_note_turn`).  The policy chose a direction and a multiplier; this
+        turns that into pixels.
         """
         held = np.asarray(action[0]).reshape(-1)
         held_vks: List[int] = []
         for i, bit in enumerate(held):
             if bit > 0.5 and i < len(self.action_space.hold_vks):
                 held_vks.append(int(self.action_space.hold_vks[i]))
-        turn_index = int(action[1])
-        tap_index = int(action[2])
-        if 0 <= turn_index < len(self.action_space.turns):
-            turn = self.action_space.turns[turn_index]
-        else:
-            turn = (0, 0)
+        direction_index = int(action[1])
+        speed_index = int(action[2])
+        tap_index = int(action[3])
+        step = self.policy.mouse_step_value()
+        turn = self.action_space.turn_delta(direction_index, speed_index, step)
         tap_vk = 0
         if 0 < tap_index < len(self.action_space.taps):
             tap_vk = int(self.action_space.taps[tap_index].get("vk", 0))
@@ -281,13 +321,15 @@ class GameSession:
         for i, bit in enumerate(held[:16]):
             if bit > 0.5:
                 mask |= 1 << i
-        index = ((mask * self.action_space.n_turn + turn_index)
-                 * self.action_space.n_tap + tap_index)
+        index = ((mask * self.action_space.n_turn + direction_index)
+                 * self.action_space.n_speed + speed_index)
+        index = index * self.action_space.n_tap + tap_index
         return {"held_vks": held_vks, "turn": tuple(turn), "tap_vk": tap_vk,
                 "index": int(index), "held_mask": int(mask),
-                "turn_index": turn_index, "tap_index": tap_index}
+                "turn_index": direction_index, "speed_index": speed_index,
+                "tap_index": tap_index, "mouse_step": int(step)}
 
-    def step(self, action: Tuple[np.ndarray, int, int]
+    def step(self, action: Tuple[np.ndarray, int, int, int]
              ) -> Tuple[np.ndarray, float, bool, Dict[str, float]]:
         """
         Apply a decision and record one transition.
@@ -319,34 +361,37 @@ class GameSession:
             truncated = truncated or extra
         self.env_seconds += time.perf_counter() - started
 
-        engaged = bool(action[0].sum() or action[1] or action[2])
+        engaged = bool(action[0].sum() or action[1] or action[2] or action[3])
         signature = self._signature_of(observation)
 
-        # Reward, novelty, reset detection and the forward model all reuse the
-        # embedding the policy already computed. One encoder pass per step.
-        embed = torch.as_tensor(self._pending_embed, dtype=torch.float32,
-                                device=self.device)
+        # Reward, novelty and reset detection all reuse the representation and
+        # the prediction the policy already produced. One transformer pass per
+        # step, for every consumer.
         action_vector = self.action_space.describe_action(
-            action[0], action[1], action[2])
+            action[0], action[1], action[2], action[3])
         reward, reset, reason = self.reward.compute(
-            embed, signature, action_vector, engaged=engaged,
-            step=self.total_steps)
+            self._pending_summary, signature, action_vector, engaged=engaged,
+            step=self.total_steps, prediction=self._pending_prediction,
+            has_prediction=self._pending_has_prediction)
 
         self.buffer.add(
-            embed=self._pending_embed,
-            hidden=self._pending_hidden,
+            context=self._pending_context,
+            summary=self._pending_summary,
+            window=self._pending_window,
             held=action[0],
-            turn=int(action[1]),
-            tap=int(action[2]),
+            direction=int(action[1]),
+            speed=int(action[2]),
+            tap=int(action[3]),
             log_prob=self._pending_log_prob,
             value=self._pending_value,
             reward=reward,
             terminal=bool(truncated),
-            previous_embed=self._pending_previous_embed,
+            reset=bool(reset),
             action_vector=action_vector,
         )
         self._held_vks = list(env_action["held_vks"])
         self._action_counts[self._action_label(action)] += 1
+        self._note_turn(action, env_action, signature)
 
         delta = 0.0
         if self.observation_signature is not None:
@@ -368,11 +413,14 @@ class GameSession:
             self._status_novel += 1
         if reset:
             self.episodes += 1
-            # The next forward-model target is on the far side of a reset, so
-            # there is no real transition to learn from; the reward module has
-            # already dropped its previous embedding for the same reason.
-            self._pending_previous_embed = np.zeros(self.cfg.embed_dim,
-                                                    dtype=np.float32)
+            # The next transition is on the far side of a reset, so there is
+            # nothing for the curiosity head to learn from across it; the
+            # buffer marks the step and the reward module has already dropped
+            # its previous summary for the same reason.
+            self._pending_summary = np.zeros(self.cfg.embed_dim,
+                                             dtype=np.float32)
+            self._pending_prediction = np.zeros(self.cfg.embed_dim,
+                                                dtype=np.float32)
 
         info = {"reward": reward, "reset": reset, "reset_reason": reason,
                 "reward_parts": dict(self.reward.last)}
@@ -439,7 +487,7 @@ class GameSession:
             f"about a window it is not driving. {detail}")
 
     # ---- helpers ----
-    def _action_label(self, action: Tuple[np.ndarray, int, int]) -> str:
+    def _action_label(self, action: Tuple[np.ndarray, int, int, int]) -> str:
         """
         Readable name for a decision, coarse enough to be a useful histogram.
 
@@ -450,11 +498,72 @@ class GameSession:
         held = np.asarray(action[0]).reshape(-1)
         count = int((held > 0.5).sum())
         parts = [f"{count} key(s)"] if count else ["no keys"]
-        if action[1]:
+        _name, delta = self.action_space.direction(int(action[1]))
+        if delta != (0, 0):
             parts.append("turn")
-        if action[2]:
+        if action[3]:
             parts.append("tap")
         return "+".join(parts)
+
+    def _note_turn(self, action: Tuple[np.ndarray, int, int, int],
+                   env_action: Dict, signature: np.ndarray) -> None:
+        """
+        Watch whether turns actually move the view, and adjust the bot's own
+        mouse step when they plainly do not.
+
+        This is the half of "the bot sets its own mouse speed" that no policy
+        gradient can reach.  The policy learns *which* speed multiplier is worth
+        choosing - that decision has a log-probability and PPO trains it like any
+        other.  What it cannot learn is what one pixel of mouse movement is worth
+        in this game, because that is not a decision: a game that locks the
+        cursor reads a raw delta of 20 as a twitch, and no amount of reward
+        shaping tells the policy that the number itself was wrong.
+
+        So it is measured instead, and deliberately slowly: a single frame is
+        evidence of very little, so the ratio of "turns that moved the view" is
+        accumulated over a window and the base step only moves when almost all
+        of them, or almost none of them, did.  Both directions are bounded by
+        `mouse_turn_min`/`mouse_turn_max` and reported in the status block, so
+        this cannot quietly run away.
+        """
+        cfg = self.cfg
+        _name, delta = self.action_space.direction(int(action[1]))
+        if delta == (0, 0):
+            return
+        self._turn_decisions += 1
+
+        moved = float(np.abs(signature - self.observation_signature).mean()) \
+            if self.observation_signature is not None else 0.0
+        if moved > 0.001:
+            self._turn_observations += 1
+
+        rate = float(cfg.mouse_adapt_rate)
+        if rate <= 0.0:
+            return
+        self._turn_window.append(1 if moved > 0.001 else 0)
+        if len(self._turn_window) < self._turn_window.maxlen:
+            return
+        moved_share = sum(self._turn_window) / len(self._turn_window)
+        if moved_share <= 0.2:
+            # Repeatedly swinging the view and seeing the same picture: the step
+            # is too small for whatever this game reads from the mouse.
+            self.policy.nudge_mouse_step(1.0 + rate)
+        elif moved_share >= 0.98:
+            self.policy.nudge_mouse_step(1.0 / (1.0 + rate))
+
+    # =====================================================================
+    # The bot's own mouse speed
+    # =====================================================================
+    def mouse_speed_line(self) -> str:
+        """What the bot is currently using as its turn step, and its range."""
+        base = self.policy.mouse_step_value()
+        levels = [float(s) for s in self.cfg.speed_levels] or [1.0]
+        rendered = "/".join(
+            str(max(1, int(round(base * level)))) for level in levels)
+        seen = (f"{self._turn_observations} of {self._turn_decisions} turn(s) "
+                f"moved the view")
+        return (f"mouse {base}px per 1x step, x[{rendered}] across "
+                f"{len(levels)} speed(s) - {seen}")
 
     def _signature_of(self, observation: np.ndarray) -> np.ndarray:
         """
@@ -479,34 +588,29 @@ class GameSession:
     # =====================================================================
     def learn(self) -> Dict[str, float]:
         """
-        Run one PPO update over the collected rollout, then train the novelty
-        nets on the same data.
+        Run one PPO update over the collected rollout, then teach the
+        transformer's own curiosity head on the same data.
 
-        The novelty nets are trained here rather than inside the control loop
-        so their gradient work is batched; see `IntrinsicReward.train_nets`.
+        The curiosity head is trained here rather than inside the control loop
+        so its gradient work is batched, and through its own optimiser so a
+        curiosity gradient never moves the policy's trunk (see
+        `Trainer.train_transition`).
         """
         if len(self.buffer) < 2:
             return {}
         started = time.perf_counter()
         metrics = self.trainer.update(self.buffer, self.last_value)
 
-        # Share whatever is left of the update budget between the two novelty
-        # nets, so a slow machine still collects frames rather than silently
-        # spending its whole life training curiosity.
+        # Share whatever is left of the update budget with the curiosity head,
+        # so a slow machine still collects frames rather than silently spending
+        # its whole life training curiosity.
         spent = time.perf_counter() - started
         remaining = max(0.0, self.cfg.update_seconds_budget * 0.5 - spent)
         tensors = self.buffer.tensors()
         if "action_vector" in tensors and remaining > 0.0:
-            novelty_metrics = self.reward.train_nets(
-                embed=tensors["embed"],
-                action=tensors["action_vector"],
-                next_embed=tensors["embed"],
-                previous_embed=tensors["previous"],
-                minibatch=self.cfg.minibatch_size,
-                steps=2,
-                budget_seconds=remaining,
-            )
-            metrics.update(novelty_metrics)
+            metrics.update(self.trainer.train_transition(
+                tensors, minibatch=self.cfg.minibatch_size, steps=2,
+                budget_seconds=remaining))
 
         self.update_seconds += time.perf_counter() - started
         self.buffer.reset()
@@ -522,9 +626,7 @@ class GameSession:
                               device=self.device).unsqueeze(0)
         self.policy.eval()
         with torch.no_grad():
-            embed = self.policy.encode(obs)
-            hidden = self.policy.gru(embed, self.hidden)
-            _h, _t, _a, value = self.policy.heads(hidden)
+            value, _hidden = self.policy.value_only(obs, self.hidden)
         self.last_value = float(value.item())
         return self.last_value
 
@@ -549,6 +651,7 @@ class GameSession:
                     f"{self._status_novel * 1000 // steps} new states/1000 "
                     f"steps, {self._status_engaged * 100 // steps}% of steps "
                     f"pressed something")
+        self._print(f"          {self.mouse_speed_line()}")
         stats = self._input_stats()
         if stats:
             self._print(
@@ -632,8 +735,9 @@ class GameSession:
                         time.sleep(0.05)
                     self.resume_env()
                     self.focus_env()
-                    # The world moved on while paused, so the recurrent state
-                    # and the pending observation are no longer a chain.
+                    # The world moved on while paused, so the transformer's
+                    # memory window and the pending observation are no longer a
+                    # chain.
                     self.observation = self._current_observation()
                     self.observation_signature = self._signature_of(
                         self.observation)
@@ -807,13 +911,18 @@ class GameSession:
             "reward_version": REWARD_VERSION,
             "model_config": {
                 "embed_dim": self.cfg.embed_dim,
-                "hidden_dim": self.cfg.hidden_dim,
-                "cnn_width": self.cfg.cnn_width,
+                "mem_tokens": self.cfg.mem_tokens,
+                "patch_size": self.cfg.patch_size,
+                "patch_width": self.cfg.patch_width,
+                "transformer_layers": self.cfg.transformer_layers,
+                "ffn_hidden": self.cfg.ffn_hidden,
+                "attention_heads": self.cfg.attention_heads,
                 "frame_size": self.cfg.frame_size,
                 "frame_stack": self.cfg.frame_stack,
                 "channels": observation_shape_channels(self.observation_shape),
                 "head_sizes": list(self.action_space.head_sizes),
                 "observation_shape": list(self.observation_shape),
+                "mouse_step": self.policy.mouse_step_value(),
             },
             "action_space": self.action_space.to_dict(),
             "policy": self.policy.state_dict(),
@@ -856,6 +965,12 @@ class GameSession:
             self.policy.load_state_dict(state["policy"])
             self.trainer.optimizer.load_state_dict(state["optimizer"])
             self.reward.load_state_dict(state.get("intrinsic") or {})
+            # The bot's own mouse step is part of what it has learned, so it
+            # comes back with the weights rather than being reset to the
+            # calibration default on every resume.
+            mouse_step = state.get("model_config", {}).get("mouse_step")
+            if mouse_step:
+                self.policy.set_mouse_step(float(mouse_step))
             self.total_steps = int(state.get("step", 0))
             self.episodes = int(state.get("episodes", 0))
             rng = state.get("rng") or {}

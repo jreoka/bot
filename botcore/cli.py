@@ -110,9 +110,37 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-held-keys", type=int, default=cfg.max_held_keys,
                         help=f"keys the bot may hold at once (default {cfg.max_held_keys})")
     parser.add_argument("--mouse-turn", type=int, default=cfg.mouse_turn_pixels,
-                        help="pixels per mouse turn step (0 = what --calibrate "
-                             "measured; a cursor-locked game measures far too "
-                             "small, so try 20 when the view does not move)")
+                        help="starting pixels for one mouse turn step "
+                             "(0 = what --calibrate measured). The bot owns "
+                             "this number: it scales it up or down as turns "
+                             "fail to move the view, and picks a multiplier "
+                             "per decision. Use this to start it somewhere "
+                             "sensible in a cursor-locked game")
+    parser.add_argument("--mouse-speed-levels", default=None,
+                        help="comma-separated speed multipliers the bot may "
+                             "choose between, e.g. 0.25,0.5,1,2,4 "
+                             f"(default {','.join(str(s) for s in cfg.speed_levels)})")
+    parser.add_argument("--mouse-adapt-rate", type=float,
+                        default=cfg.mouse_adapt_rate,
+                        help="how hard the bot may correct its own base mouse "
+                             "step when turns do not move the view "
+                             f"(default {cfg.mouse_adapt_rate}; 0 pins "
+                             "--mouse-turn instead of starting a search)")
+
+    # ---- model (one SwiGLU + RoPE transformer) ----
+    parser.add_argument("--embed-dim", type=int, default=cfg.embed_dim,
+                        help=f"transformer width (default {cfg.embed_dim})")
+    parser.add_argument("--layers", type=int, default=cfg.transformer_layers,
+                        help=f"transformer blocks (default "
+                             f"{cfg.transformer_layers})")
+    parser.add_argument("--memory-window", type=int, default=cfg.mem_tokens,
+                        help=f"past frames the transformer attends to "
+                             f"(default {cfg.mem_tokens})")
+    parser.add_argument("--patch-size", type=int, default=cfg.patch_size,
+                        help=f"pixels per patch token (default "
+                             f"{cfg.patch_size})")
+    parser.add_argument("--heads", type=int, default=cfg.attention_heads,
+                        help=f"attention heads (default {cfg.attention_heads})")
 
     # ---- training ----
     parser.add_argument("--rollout", type=int, default=cfg.rollout_steps,
@@ -172,6 +200,17 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def config_from_args(args: argparse.Namespace) -> Config:
+    speed_levels = None
+    raw_levels = getattr(args, "mouse_speed_levels", None)
+    if raw_levels:
+        try:
+            speed_levels = tuple(
+                float(part) for part in str(raw_levels).replace(",", " ").split()
+                if part.strip())
+        except ValueError:
+            print(f"[Config] --mouse-speed-levels '{raw_levels}' is not a list "
+                  f"of numbers; using the default.")
+            speed_levels = None
     cfg = Config(
         window_hwnd=args.window,
         prefer_game_window=not args.pick,
@@ -181,6 +220,13 @@ def config_from_args(args: argparse.Namespace) -> Config:
         target_fps=args.fps,
         max_held_keys=args.max_held_keys,
         mouse_turn_pixels=args.mouse_turn,
+        mouse_adapt_rate=args.mouse_adapt_rate,
+        speed_levels=speed_levels or Config().speed_levels,
+        embed_dim=args.embed_dim,
+        transformer_layers=args.layers,
+        mem_tokens=args.memory_window,
+        patch_size=args.patch_size,
+        attention_heads=args.heads,
         rollout_steps=args.rollout,
         minibatch_size=args.minibatch,
         epochs_per_update=args.epochs,
@@ -348,7 +394,7 @@ def run_training(cfg: Config, args) -> int:
         print(f"[Check] {warning}")
 
     space = ActionSpace.build(keymap, max_held=cfg.max_held_keys,
-                              turn_levels=cfg.turn_levels)
+                              speed_levels=cfg.speed_levels)
     print(f"[Actions] {space.describe()}")
 
     from .game import RealGameEnv
