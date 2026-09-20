@@ -263,6 +263,56 @@ def benchmark(cfg: Config, keymap: Keymap, decisions: int = 120) -> int:
     return 0
 
 
+def action_space_advice(cfg: Config, keymap: Keymap,
+                        space: ActionSpace) -> List[str]:
+    """
+    Say out loud when the whitelist cannot produce movement.
+
+    This is the other half of "the bot just stands there".  A keymap recorded
+    from a short calibration can easily end up containing no movement key at
+    all - a player who spent the minute in a menu, or in a game where the
+    forward key is W and the recorder only caught the strafe key.  The action
+    space is then perfectly well-formed and completely unable to walk: the
+    policy presses what it has, the screen barely changes, and the run looks
+    like a broken learner when it is really a broken whitelist.
+
+    A cursor-locked game has the same failure by a different route.  Such a
+    title hides the real look speed from the recorder, so the measured mouse
+    step comes out at a pixel or two, and the bot's idea of "turn the view" is
+    a twitch nothing can see.  Both are checked here because both are fixed by
+    a command-line flag rather than by waiting for the bot to learn better.
+    """
+    lines: List[str] = []
+    holds = {str(name).upper() for name in space.hold_names}
+    movement = {"W", "A", "S", "D"}
+    if not (holds & movement):
+        lines.append(
+            f"No movement key in the whitelist: hold=[{', '.join(sorted(holds)) or '-'}]. "
+            f"A bot with no way to walk cannot make progress on any game - it "
+            f"will press what it has and look like it is shaking on the spot.")
+        lines.append(
+            f"Fix: re-run --calibrate and spend the recording actually walking "
+            f"around, or edit '{cfg.keymap_path}' to add W/A/S/D (or whatever "
+            f"this game calls forward).")
+    if keymap is not None and int(keymap.default_mouse_turn) < 4:
+        lines.append(
+            f"The mouse turn step is {int(keymap.default_mouse_turn)} px, which "
+            f"is the signature of a game that locks the cursor: the recorder "
+            f"cannot see the real look speed, so every 'turn' decision is a "
+            f"twitch. The view will not move and the bot cannot aim.")
+        lines.append(
+            f"Fix: pass --mouse-turn 20 (or more) and watch whether the view "
+            f"actually turns. Try --check-capture while pressing the turn key "
+            f"if you are not sure.")
+    taps = {str(t.get("label", "")) for t in space.taps}
+    if len(space.taps) > 6:
+        lines.append(
+            f"{len(space.taps)} tap/click choices are enabled, so a large share "
+            f"of every rollout is spent on clicking things. In a game with an "
+            f"inventory or an attack button this is mostly wasted input.")
+    return lines
+
+
 def preflight(cfg: Config, keymap: Optional[Keymap],
               target: Optional[dict] = None) -> List[str]:
     """
@@ -273,6 +323,22 @@ def preflight(cfg: Config, keymap: Optional[Keymap],
     completely healthy-looking run with nothing happening in the game, so it is
     worth more than one line of checking.
     """
+    warnings: List[str] = preflight_warnings(cfg, keymap, target)
+    space = None
+    if keymap is not None:
+        try:
+            space = ActionSpace.build(keymap, max_held=cfg.max_held_keys,
+                                      turn_levels=cfg.turn_levels)
+        except Exception:
+            space = None
+    if space is not None:
+        warnings.extend(action_space_advice(cfg, keymap, space))
+    return warnings
+
+
+def preflight_warnings(cfg: Config, keymap: Optional[Keymap],
+                       target: Optional[dict] = None) -> List[str]:
+    """The window/liveness warnings, before the action-space advice."""
     warnings: List[str] = []
     import torch
     if os.name != "nt":
@@ -314,6 +380,5 @@ def preflight(cfg: Config, keymap: Optional[Keymap],
                 f"pixel(s) (measured median {measured:.1f} px at calibration). "
                 f"A game that locks the cursor hides your real look speed from "
                 f"the recorder, so this is usually far too small for the bot "
-                f"to turn with: set it explicitly with --mouse-turn 20 and "
-                f"watch whether the view turns.")
+                f"to turn with.")
     return warnings

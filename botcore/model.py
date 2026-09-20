@@ -125,51 +125,134 @@ class ActorCritic(nn.Module):
 
     # ---- the held-key decision ----
     #
-    # Each key is an independent Bernoulli bit. Two reasons this beats a softmax
-    # over key combinations, and one reason it beats a constrained top-k rule
-    # (which this file used first, and which is subtly and silently wrong):
+    # The held-key head is a set of independent Bernoulli bits, conditioned on
+    # at most `max_held` of them being set.  Why independent bits rather than a
+    # softmax over combinations:
     #
     #   * There are 2**11 combinations. A softmax over them can never be
     #     explored; independent bits let "walk" and "also sprint" be learned
     #     separately and then combined, which is what a player does.
     #   * The gradient of an independent Bernoulli log-probability with respect
     #     to *its own* logit has the right sign for every key, taken or not.
-    #     The top-k rule does not: its normaliser couples every key to every
-    #     other, and an untaken key ends up with the same gradient sign as a
-    #     taken one. A policy trained that way drifts toward holding every key
-    #     at once, which moves it nowhere, and the symptom is indistinguishable
-    #     from "this bot cannot learn".
     #
-    # The cap on simultaneous keys is applied when sampling, by keeping the most
-    # likely keys. That is a truncation rather than an exact constrained
-    # distribution, and it is deliberate - the exact version is the coupling
-    # described above.
+    # The cap is part of the distribution rather than a post-hoc edit of the
+    # sample (see `held_log_prob`), because PPO compares the probability the
+    # policy assigned to an action during collection with the probability it
+    # assigns to that same action during the update. A sample that is modified
+    # after its log-probability is recorded makes those two numbers disagree,
+    # and the ratio - and therefore the gradient - is meaningless.
     def sample_held(self, logits: torch.Tensor):
-        """(..., n_keys) -> bits, and the log-probability of those bits."""
-        probabilities = torch.sigmoid(logits)
-        bits = torch.bernoulli(probabilities)
+        """
+        Draw a key-set from the capped distribution, and log its probability.
+
+        Sampling goes through the same category set the update scores with, so
+        the recorded log-probability is reproducible under the policy that is
+        being optimised.
+        """
+        masks = self._held_categories(logits)
+        scores = self.held_logits_of_masks(logits, masks)
+        index = torch.distributions.Categorical(logits=scores).sample()
+        bits = masks[index]
+        # `held_log_prob` is reused rather than recomputed inline, so sampling
+        # and scoring cannot drift apart again.
         return bits, self.held_log_prob(logits, bits)
 
-    def truncate_held(self, bits: torch.Tensor, logits: torch.Tensor
-                      ) -> torch.Tensor:
-        """Keep at most max_held keys: the ones the policy is most sure of."""
-        if bits.shape[-1] <= self.max_held:
-            return bits
-        order = torch.argsort(logits, dim=-1, descending=True)
-        keep = torch.zeros_like(bits)
-        keep.scatter_(-1, order[..., :self.max_held], 1.0)
-        return bits * keep
+    # ---- the distribution the log-probabilities are taken under -----------
+    #
+    # Sampling and scoring *must* be the same distribution, because PPO divides
+    # one by the other. They were not: the sampler drew independent Bernoulli
+    # bits and then silently dropped keys past the cap, while the update scored
+    # the surviving bits as if they had been drawn from those Bernoullis
+    # directly. Any step where the cap fired recorded a log-probability the
+    # update could not reproduce - measured at up to ~6 nats, a ratio of 400 -
+    # so every update was dominated by a truncation artefact instead of by
+    # advantage. The symptoms were a fitted KL near -1.2, three quarters of
+    # samples outside the trust region, an explained variance of -10^4, and a
+    # policy that never moved.
+    #
+    # The fix is one distribution used by both paths:
+    #
+    #     P(mask) is proportional to prod_{i in mask} p_i * prod_{i not in mask} (1 - p_i)
+    #     ... restricted to |mask| <= max_held, renormalised over the kept masks.
+    #
+    # which is "independent bits, conditioned on holding at most k keys".  It is
+    # what the sampler always meant to draw from, it is exact, and it can be
+    # scored cheaply by enumerating the kept masks: C(9, <=4) = 256 of them for
+    # a nine-key whitelist.
+    def _held_categories(self, logits: torch.Tensor) -> torch.Tensor:
+        """Every key-mask with at most ``max_held`` bits set, as (n_cat, n_keys)."""
+        n_keys = int(logits.shape[-1])
+        cached = getattr(self, "_held_mask_cache", None)
+        if (cached is None or cached.shape[-1] != n_keys
+                or cached.shape[0] == 0
+                or cached.device != logits.device
+                or cached.dtype != logits.dtype):
+            masks = []
+            for mask in range(1 << n_keys):
+                if bin(mask).count("1") <= self.max_held:
+                    masks.append([(mask >> i) & 1 for i in range(n_keys)])
+            cached = torch.tensor(masks, dtype=logits.dtype,
+                                  device=logits.device)
+            self._held_mask_cache = cached
+        return cached
+
+    @staticmethod
+    def _mask_codes(masks: torch.Tensor) -> torch.Tensor:
+        """(n_cat, n_keys) bits -> (n_cat,) integer codes, for indexing."""
+        n_keys = int(masks.shape[-1])
+        weights = (1 << torch.arange(n_keys - 1, -1, -1,
+                                     device=masks.device, dtype=torch.long))
+        return (masks > 0.5).to(torch.long) @ weights
+
+    def held_logits_of_masks(self, logits: torch.Tensor,
+                             masks: torch.Tensor) -> torch.Tensor:
+        """
+        Unnormalised log-probability of every category.
+
+        ``logits`` is (..., n_keys) and ``masks`` is (n_cat, n_keys); the result
+        is (..., n_cat).  The per-key term is the Bernoulli log-probability of
+        that bit, so this is the independent-bits model restricted to the
+        categories that respect the cap.
+        """
+        n_cat = int(masks.shape[0])
+        # Explicit broadcast to (..., n_cat, n_keys), then the per-key Bernoulli
+        # log-probability of that bit: -softplus(-z) for a set bit and
+        # -softplus(z) for an unset one, which is log sigmoid(z) and
+        # log(1 - sigmoid(z)) written the numerically stable way round.
+        wide = logits.unsqueeze(-2).expand(*logits.shape[:-1], n_cat,
+                                           logits.shape[-1])
+        per_key = -(torch.nn.functional.softplus(
+            torch.where(masks > 0.5, -wide, wide)))
+        return per_key.sum(dim=-1)
 
     def held_log_prob(self, logits: torch.Tensor,
                       held: torch.Tensor) -> torch.Tensor:
-        """Log-probability of a set of bits, under the independent bits."""
-        return (-F.binary_cross_entropy_with_logits(
-            logits, held, reduction="none")).sum(dim=-1)
+        """
+        Log-probability of a key-set under the capped distribution.
+
+        Shared by the sampler and the update, which is the whole point: the
+        importance ratio PPO computes is only meaningful when the behaviour
+        distribution and the scored distribution are the same one.
+        """
+        masks = self._held_categories(logits)
+        scores = self.held_logits_of_masks(logits, masks)
+        log_norm = torch.logsumexp(scores, dim=-1, keepdim=True)
+        codes = self._mask_codes(masks)
+        target = self._mask_codes((held > 0.5).to(masks.dtype))
+        position = (codes.unsqueeze(0) == target.unsqueeze(-1))
+        selected = (scores * position.to(scores.dtype)).sum(dim=-1)
+        # A mask outside the category set cannot come out of `sample`, but if one
+        # ever did, its probability is zero rather than a silently wrong number.
+        in_set = position.any(dim=-1)
+        return torch.where(in_set, selected - log_norm.squeeze(-1),
+                           torch.full_like(selected, -1e9))
 
     def held_entropy(self, logits: torch.Tensor) -> torch.Tensor:
-        """Sum of the per-key Bernoulli entropies."""
-        p = torch.sigmoid(logits).clamp(1e-6, 1.0 - 1e-6)
-        return -(p * p.log() + (1.0 - p) * (1.0 - p).log()).sum(dim=-1)
+        """Entropy of the capped distribution, in nats."""
+        masks = self._held_categories(logits)
+        scores = self.held_logits_of_masks(logits, masks)
+        log_probs = torch.log_softmax(scores, dim=-1)
+        return -(log_probs.exp() * log_probs).sum(dim=-1)
 
     # ---- forward paths ----
     def encode(self, frames: torch.Tensor) -> torch.Tensor:
@@ -193,7 +276,9 @@ class ActorCritic(nn.Module):
         hold_logits, turn_logits, tap_logits, value = self.heads(hidden)
 
         bits, log_prob = self.sample_held(hold_logits)
-        bits = self.truncate_held(bits, hold_logits)
+        # No post-hoc truncation here: the cap is already part of the
+        # distribution `sample_held` drew from, so the action needs no edit and
+        # its log-probability is exactly the one the update will recompute.
         turn_dist = torch.distributions.Categorical(logits=turn_logits)
         tap_dist = torch.distributions.Categorical(logits=tap_logits)
         turn = turn_dist.sample()

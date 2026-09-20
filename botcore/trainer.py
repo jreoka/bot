@@ -211,16 +211,17 @@ class Trainer:
         mb_adv = adv[grid]
         mb_ret = ret[grid]
 
-        # Run the recurrence from the stored per-step states. The frame
-        # embeddings were computed once during collection and are reused here,
-        # so the encoder does not run again - and, more importantly, the
-        # recurrent states are the ones the actions were actually taken with,
-        # which is what makes the PPO ratio correct.
-        t_steps, batch = embed.shape[0], embed.shape[1]
-        hidden_states = self.policy.gru(
-            embed.reshape(t_steps * batch, -1),
-            hidden.reshape(t_steps * batch, -1))
-        hidden_states = hidden_states.reshape(t_steps, batch, -1)
+        # Score the recorded actions with the recurrent state that was in force
+        # *before* each step - the same state the action was sampled with. The
+        # frame embeddings were computed once during collection and are reused
+        # here, so the encoder does not run again.
+        #
+        # This used to advance the GRU one more step and score with the result,
+        # which is the state *after* the action: the collection path used
+        # `hidden` and the update path used `gru(embed, hidden)`, so `old_logp`
+        # and `log_prob` disagreed by construction even before the optimiser
+        # ran. That alone was worth a large part of the ratio error.
+        hidden_states = hidden
 
         log_prob, entropy, value = self.policy.sequence_log_prob(
             hidden_states, held, turn, tap)

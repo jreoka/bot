@@ -4,6 +4,11 @@
 !bot1.py
 !botcore/
 !botcore/**
+# Compiled bytecode is a build artefact, not source: it is machine- and
+# interpreter-specific and only ever adds noise to a diff.
+botcore/__pycache__/
+**/__pycache__/
+*.pyc
 !keymap.json
 !requirements.txt
 !.gitignore

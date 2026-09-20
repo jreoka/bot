@@ -570,7 +570,11 @@ class GameSession:
                 self._print("          [Health] One decision type owns almost "
                             "every step. Raise entropy_coef to push the policy "
                             "apart, or lower w_idle if it is 'no keys'.")
-        self._action_counts = {}
+        # Back to a *defaultdict*: the next step does
+        # `self._action_counts[label] += 1`, and a plain dict here raises
+        # KeyError on the first action label that was not in the previous
+        # window - which killed the run on the first status block.
+        self._action_counts = defaultdict(int)
 
         for message in self.health.end_window(
                 steps, self._status_engaged, self.trainer.last_update_seconds):
