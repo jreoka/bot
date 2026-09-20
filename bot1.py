@@ -181,7 +181,7 @@ EPOCHS_PER_UPDATE = 2               # passes over each rollout
 # cannot fight the estimator. A decaying schedule on top of Prodigy is the one
 # combination that reliably fails to converge, which is why nothing here
 # selects an optimizer any more.
-OPTIMIZER_LR = 0.001
+OPTIMIZER_LR = 0.01
 LR_WARMUP_UPDATES = 20              # updates spent ramping the LR up
 LR_DECAY_UPDATES = 5000             # updates over which it cosine-decays
 LR_MIN_FRACTION = 1.0               # floor of the decay, as a fraction of base
