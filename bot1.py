@@ -128,7 +128,7 @@ PREFER_GAME_WINDOW = True
 FOREVER = "forever"
 FOREVER_STEPS = 10 ** 12            # effectively unlimited: ~1000 years at 30 Hz
 TOTAL_STEPS = FOREVER              # forever | an int, e.g. 100_000
-BATCH_SIZE = 16                     # transitions per PPO update
+BATCH_SIZE = 8                     # transitions per PPO update
 # Control rate. TARGET_FPS is the wall-clock ceiling on how often the bot sees
 # the screen and can act; CAPTURE_DELAY is an extra sleep on top of that. At
 # 96px/20Hz the loop reacts in about 50 ms, which is fast enough to answer most
@@ -150,7 +150,7 @@ CAPTURE_DELAY = 0.0                # extra seconds slept between steps
 #      dominates and its cost is nearly flat from 64px to 96px. 96px is
 #      therefore kept for visual detail; it is not what is slowing you down.
 # Raise these only if the [Perf] line in the log shows room to spare.
-IMG_SIZE = 96
+IMG_SIZE = 128
 SEQ_LEN = 16
 DEVICE = "auto"                    # auto | cuda | cpu
 PRIORITY = "normal"          # below_normal | normal | high
@@ -181,7 +181,7 @@ EPOCHS_PER_UPDATE = 2               # passes over each rollout
 # cannot fight the estimator. A decaying schedule on top of Prodigy is the one
 # combination that reliably fails to converge, which is why nothing here
 # selects an optimizer any more.
-OPTIMIZER_LR = 1.0
+OPTIMIZER_LR = 0.001
 LR_WARMUP_UPDATES = 20              # updates spent ramping the LR up
 LR_DECAY_UPDATES = 5000             # updates over which it cosine-decays
 LR_MIN_FRACTION = 1.0               # floor of the decay, as a fraction of base
