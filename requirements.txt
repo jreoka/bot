@@ -1,7 +1,14 @@
-torch
-numpy
-prodigyopt
-opencv-python
-gymnasium
+# The bot itself needs only these. Nothing here is optional at runtime on
+# Windows: the model and trainer use torch and numpy, capture and frame
+# handling use opencv-python, and the window and input code uses pywin32.
+torch>=2.0
+numpy>=1.24
+opencv-python>=4.8
 pywin32==312; sys_platform == "win32"
-soundcard
+
+# Not needed any more, and deliberately absent:
+#   prodigyopt  - the policy uses Adam and the novelty nets use plain SGD
+#   gymnasium   - the environment is a plain class; the Gym wrapper only added
+#                 indirection to a loop that is already explicit
+#   soundcard   - the audio branch cost more CPU than the whole video encoder
+#                 and taught the bot almost nothing game-agnostic

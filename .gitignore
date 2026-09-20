@@ -1,11 +1,9 @@
 *
 !LICENSE
+!README.md
 !bot1.py
+!botcore/
+!botcore/**
 !keymap.json
-!.gitignore
 !requirements.txt
-!CHANGES.md
-!test_model.py
-!test_training.py
-!test_checkpoint_compat.py
-!bench_model.py
+!.gitignore
