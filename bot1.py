@@ -261,6 +261,14 @@ HUMAN_RELEASE_GRACE_SECONDS = 3.0
 # re-centres the cursor itself and that arrives as an un-injected move, which
 # would look like you touching the mouse.
 HUMAN_MOUSE_TAKEOVER = True
+# True = while the bot is watching you play, a key the keymap does not know is
+# added to it and saved. That resizes the action set, so the next launch starts
+# a fresh policy. False (the default) keeps the keymap immutable during
+# training: watch mode only ever sees the keys that are already in the JSON, and
+# anything else you press is ignored - it does not hand you the controls, it is
+# not recorded and it is not written back. Add keys with --calibrate, or by
+# editing the JSON, instead.
+HUMAN_WATCH_LEARNS_NEW_KEYS = False
 # Frames of your play kept in memory to learn from, stored at IMG_SIZE in RGB
 # (~77 KB each at 160px, so 1500 frames is about 115 MB).
 HUMAN_REPLAY_MAX_FRAMES = 1500
@@ -761,15 +769,12 @@ TRACKED_HOLD = "use"
 
 class Keymap:
     """
-    The bot's whitelist of input, plus a little self-tuning.
+    The bot's whitelist of input: the fixed list of keys it may press.
 
-    Built once by --calibrate, then reloaded by every run. While a training run
-    is watching you play, any *new* key you press is folded in and written back
-    to disk, so the keymap grows with you instead of needing a fresh
-    calibration run every time you rebind something. The action set is rebuilt
-    from the keymap at each launch, so such a key becomes pressable then - and
-    because the action space changes size when that happens, that launch starts
-    a fresh policy.
+    Built once by --calibrate, then reloaded by every run. The list is not
+    modified while the bot is training: watch mode is strictly bounded by it, so
+    a key that is not in here is one the bot can neither press nor learn from
+    you. Changing the whitelist means a --calibrate run or an edit to the JSON.
     """
 
     VERSION = 1
@@ -2335,6 +2340,11 @@ def _calibration_status(recorder: InputRecorder) -> Optional[str]:
 #
 # This is the old separate "--watch mode" folded into the training loop: there
 # is no recording session to start, no countdown and no handoff prompt.
+#
+# Watch mode is read-only, and it only ever looks at what the keymap already
+# knows: a key you press that is not in keymap.json is ignored outright. It does
+# not hand you the controls, nothing is recorded and it is not written back into
+# the keymap - so the action set never changes size underneath a running policy.
 # =============================================================================
 
 # KBDLLHOOKSTRUCT.flags bit meaning "this event was injected". (The mouse
@@ -2734,8 +2744,11 @@ class HumanWatcher:
 
     Every event carries an "injected" flag; SendInput sets it and your hardware
     does not, so the bot's own traffic is filtered out here and a single
-    unflagged key press, click or mouse movement is what hands you the
-    controls.
+    unflagged press of a key or button the keymap knows about - or a real mouse
+    movement - is what hands you the controls.
+
+    Anything outside the keymap is ignored, and the keymap is never written to
+    from here: see HUMAN_WATCH_LEARN_NEW_KEYS.
     """
 
     def __init__(self, target_hwnd: int = 0, keymap: Optional[Keymap] = None,
@@ -2749,6 +2762,10 @@ class HumanWatcher:
         self.events = 0
         self.new_keys: List[str] = []
         self.errors: List[str] = []
+        # Keys pressed that this keymap does not know about. They are ignored
+        # completely; the list only exists so one line per takeover can say what
+        # was dropped and why. Guarded by _lock, since the hook thread appends.
+        self._ignored: set = set()
 
         self._lock = threading.RLock()
         self._last_activity = 0.0
@@ -2772,26 +2789,40 @@ class HumanWatcher:
         self._watch_vks = self._build_watch_vks()
 
     # ---- lookup ----
+    def configured(self, name: str) -> bool:
+        """
+        True when `name` is part of what this run is allowed to press.
+
+        The keymap - the JSON on disk - is the whole story. Watch mode neither
+        grows it nor reacts to anything outside it, so this is the gate every
+        event from your hands passes through.
+        """
+        if self.keymap is None:
+            return False
+        upper = str(name).upper()
+        return upper in self.keymap.keys or upper in self.keymap.mouse_buttons
+
+    def _note_ignored(self, name: str):
+        """Remember a key that this keymap does not know (caller holds the lock)."""
+        upper = str(name).upper()
+        if len(self._ignored) < 32:
+            self._ignored.add(upper)
+
     def _build_watch_vks(self) -> List[int]:
         """
-        Every key whose live state is worth polling.
+        Every key whose live state is worth polling: exactly the configured
+        keys and mouse buttons, and nothing else.
 
         This is the fallback for the case where the OS quietly removes a hook
         (it does that when the owning thread is slow): if a watched key is
         physically down and the bot is not the one holding it, it is you.
         """
-        names = set(DEFAULT_HOLD_KEYS) | set(DEFAULT_TAP_KEYS)
-        if self.keymap is not None:
-            names |= set(self.keymap.keys)
-            names |= set(self.keymap.mouse_buttons)
         vks = set()
-        for name in names:
-            vk = None
-            if self.keymap is not None:
+        if self.keymap is not None:
+            for name in set(self.keymap.keys) | set(self.keymap.mouse_buttons):
                 vk = self.keymap.vk(name) or self.keymap.button_vk(name)
-            vk = vk or calibratable_keys().get(str(name).upper())
-            if vk:
-                vks.add(int(vk))
+                if vk:
+                    vks.add(int(vk))
         for vk in (0x01, 0x02, 0x04):              # mouse buttons
             vks.add(vk)
         vks -= self.ignored_vks
@@ -2962,6 +2993,17 @@ class HumanWatcher:
         now = time.perf_counter()
         learn = False
         with self._lock:
+            # A key this keymap does not know is not yours to press as far as
+            # the bot is concerned: ignore it whole. It does not count as
+            # activity, so it neither hands you the controls nor holds the
+            # takeover open, and it is not recorded. The key-up is still
+            # processed, so that a release can never later be mistaken for a
+            # fresh press.
+            if not self.configured(name):
+                self._note_ignored(name)
+                if not pressed:
+                    self._human_pressed.pop(name, None)
+                return
             self._last_activity = now
             if pressed:
                 repeat = name in self._human_pressed
@@ -2970,8 +3012,8 @@ class HumanWatcher:
                     self._record("key", name, True, now)
                     # Only grow the keymap from keys pressed *in the game*;
                     # what you type into another window is not the bot's
-                    # business.
-                    learn = self._focused()
+                    # business. Off by default - see HUMAN_WATCH_LEARN...
+                    learn = bool(HUMAN_WATCH_LEARNS_NEW_KEYS) and self._focused()
             else:
                 self._human_pressed.pop(name, None)
                 self._record("key", name, False, now)
@@ -2985,13 +3027,18 @@ class HumanWatcher:
         now = time.perf_counter()
         learn = False
         with self._lock:
+            if not self.configured(name):
+                self._note_ignored(name)
+                if not pressed:
+                    self._human_pressed.pop(name, None)
+                return
             self._last_activity = now
             if pressed:
                 repeat = name in self._human_pressed
                 self._human_pressed[name] = now
                 if not repeat:
                     self._record("mouse_btn", button, True, now)
-                    learn = self._focused()
+                    learn = bool(HUMAN_WATCH_LEARNS_NEW_KEYS) and self._focused()
             else:
                 self._human_pressed.pop(name, None)
                 self._record("mouse_btn", button, False, now)
@@ -3023,12 +3070,13 @@ class HumanWatcher:
 
     def _learn(self, name: str):
         """
-        Remember a button the calibrated keymap does not know about yet.
+        Write a key you just pressed into the keymap.
 
-        It goes into keymap.json now, and the action set is rebuilt from the
-        keymap at the start of the next launch, so it becomes something the bot
-        can actually press - at the cost of a fresh policy, because the action
-        space (and so the policy head) has changed size.
+        Only reachable when HUMAN_WATCH_LEARNS_NEW_KEYS is turned on, because
+        growing the whitelist mid-run resizes the action set and forces a fresh
+        policy on the next launch. With the default (off), watch mode is
+        read-only: the keymap only ever changes through --calibrate or a hand
+        edit of the JSON.
         """
         if self.keymap is None:
             return
@@ -3086,6 +3134,11 @@ class HumanWatcher:
         with self._lock:
             return sorted(self._human_pressed)
 
+    def ignored_keys(self) -> List[str]:
+        """Names this keymap does not know that were pressed during the takeover."""
+        with self._lock:
+            return sorted(self._ignored)
+
     # ---- recording one takeover ----
     def begin_segment(self) -> RecordedInput:
         """
@@ -3102,6 +3155,7 @@ class HumanWatcher:
             self._frame_times = []
             self._cap_hit = False
             self._mouse_pos = None
+            self._ignored = set()
         return segment
 
     def capture(self, frame: Optional[np.ndarray]) -> bool:
@@ -3155,6 +3209,7 @@ class HumanTakeover:
         self.takeovers = 0
         self.steps_watched = 0
         self._next_notice = 0.0
+        self._ignored: List[str] = []
 
     # ---- the pause path ----
     def idle(self):
@@ -3174,6 +3229,7 @@ class HumanTakeover:
             # bot was suspended - but resume_bot() is a no-op if it was not.
             self.env.resume_bot()
             self.watcher.end_segment()
+            self._report_ignored()
 
     # ---- the one call the training loop makes ----
     def service(self) -> str:
@@ -3212,6 +3268,15 @@ class HumanTakeover:
         print(f"[Human] It is watching what you press, and takes the controls "
               f"back {HUMAN_RELEASE_GRACE_SECONDS:.0f}s after your last input.")
 
+    def _report_ignored(self):
+        """Say what was pressed that this keymap does not know, once, at the end."""
+        ignored = self._ignored
+        self._ignored = []
+        if ignored:
+            print(f"[Human] Ignored (not in the keymap): {', '.join(ignored)}"
+                  + (" ..." if len(ignored) >= 32 else "")
+                  + " - the bot only reacts to the keys in keymap.json.")
+
     def _end(self):
         self.active = False
         self.env.resume_bot()
@@ -3220,6 +3285,7 @@ class HumanTakeover:
         if not frames:
             print("[Human] Hands off - taking the controls back. Nothing was "
                   "recorded: the game window was not focused.")
+            self._report_ignored()
             return
 
         segment = build_human_replay(frames, recorded["timestamps"],
@@ -3228,6 +3294,7 @@ class HumanTakeover:
         if segment is None:
             print(f"[Human] Hands off - taking the controls back. Recorded "
                   f"{len(frames)} frame(s), too few to learn anything from.")
+            self._report_ignored()
             return
 
         self.replay.add(segment)
@@ -3248,6 +3315,7 @@ class HumanTakeover:
               + (f" [{'; '.join(notes)}]" if notes else ""))
         print(f"[Human] Imitation buffer now holds {len(self.replay)} frame(s) "
               f"({self.replay.describe()}); the next PPO updates will copy them.")
+        self._report_ignored()
         if self.watcher.new_keys:
             saved = None
             try:
@@ -6975,10 +7043,11 @@ def main(argv: Optional[List[str]] = None) -> int:
     human = HumanWatcher(target_hwnd=hwnd, keymap=keymap,
                          ignored_vks=hotkey_vks(), verbose=True)
     if human.start():
-        print(f"[Human] Watching for you: any real key press, mouse button or "
-              f"mouse movement hands the controls back to you, and the bot "
-              f"takes them again {HUMAN_RELEASE_GRACE_SECONDS:.0f}s after your "
-              f"last input.")
+        print(f"[Human] Watching for you: any key or mouse button in the keymap "
+              f"hands the controls back to you, and the bot takes them again "
+              f"{HUMAN_RELEASE_GRACE_SECONDS:.0f}s after your last input.")
+        print("[Human] Keys that are not in the keymap are ignored: they neither "
+              "hand over the controls nor are they added to it.")
     else:
         for err in human.errors:
             print(f"[Human] {err}")
