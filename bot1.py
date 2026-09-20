@@ -154,7 +154,7 @@ IMG_SIZE = 96
 SEQ_LEN = 16
 DEVICE = "auto"                    # auto | cuda | cpu
 PRIORITY = "normal"          # below_normal | normal | high
-SHOW_PREVIEW = True               # small live view of what the model sees
+SHOW_PREVIEW = False               # small live view of what the model sees
 ENABLE_HOTKEYS = True              # global pause / save / quit hotkeys
 RUN_STARTUP_TESTS = True           # capture/audio/input checks at startup
 
@@ -189,7 +189,7 @@ GRAD_CLIP_NORM = 1.0                # was 0.5; 1.0 is the PPO default
 VISUAL_DIM = 128
 AUDIO_DIM = 64
 HIDDEN_DIM = 128
-NUM_BLOCKS = 2
+NUM_BLOCKS = 4
 NUM_HEADS = 4
 FFN_HIDDEN = None                   # None = the standard 2/3 * 4 * d_model
 DROPOUT = 0.0
