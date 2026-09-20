@@ -3156,6 +3156,25 @@ class HumanTakeover:
         self.steps_watched = 0
         self._next_notice = 0.0
 
+    # ---- the pause path ----
+    def idle(self):
+        """
+        Called instead of service() while the bot is paused with the pause key.
+
+        A pause is not a takeover: the watch mode must not arm while the bot is
+        paused, so nothing is observed, recorded or learned here. If a takeover
+        was already in progress when the pause key went down, it is closed
+        without recording, so the bot hands the controls back and does not come
+        out of the pause still believing you are playing.
+        """
+        if self.active:
+            self.active = False
+            self.steps_watched = 0
+            # The controls could only have been handed over, never back, so the
+            # bot was suspended - but resume_bot() is a no-op if it was not.
+            self.env.resume_bot()
+            self.watcher.end_segment()
+
     # ---- the one call the training loop makes ----
     def service(self) -> str:
         if self.watcher.human_active(self.env.held_vks):
@@ -5707,7 +5726,10 @@ def train_ppo(
     the moment you touch the keyboard or mouse: it collects no transitions, it
     sends no input, it records what you did, and HUMAN_RELEASE_GRACE_SECONDS
     after your last input it resumes and takes one imitation step towards your
-    behaviour after each of the next PPO updates.
+    behaviour after each of the next PPO updates. While the bot is paused with
+    the pause key, none of that happens: a pause keeps watch mode off entirely,
+    so what you do to the keyboard during a pause is never observed, recorded
+    or learned from.
 
     The entropy bonus keeps the policy from collapsing onto a single action.
     With ADAPTIVE_ENTROPY it is raised automatically whenever the policy stops
@@ -5890,13 +5912,14 @@ def train_ppo(
                 if control.claim_pause_notice():
                     print("[Control] PAUSED. The bot sends no input while paused. "
                           "Press the pause key again to resume.")
-                # Stay in the pause, but keep servicing a takeover: pressing F8
-                # and then playing should still record what you did.
+                # Stay in the pause. The watch mode is off for the whole pause:
+                # the bot observes nothing, records nothing and learns nothing
+                # until you press the pause key again.
                 while control.paused and not control.stop_requested:
                     for message in control.service():
                         print(f"[Control] {message}")
                     if takeover is not None:
-                        takeover.service()
+                        takeover.idle()
                     time.sleep(0.05)
 
             due = control.checkpoint_due()
