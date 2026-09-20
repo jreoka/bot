@@ -168,22 +168,23 @@ RUN_STARTUP_TESTS = True           # capture/audio/input checks at startup
 #     over minibatches; once exceeded, that update stops where it is and
 #     control returns to the game. This is the hard guarantee against a stall:
 #     no single update can run away with the whole run.
-#   * The optimizer gets a short warmup then a cosine decay to LR_MIN_FRACTION,
-#     which is what stops the policy from oscillating forever without ever
-#     converging once the novelty bonus inevitably shrinks.
+#   * The optimizer gets a short warmup, and then holds: LR_MIN_FRACTION is
+#     left at 1.0, so there is no decay for Prodigy's own step-size estimate to
+#     fight. That estimate, not a hand-tuned schedule, is what keeps the policy
+#     from oscillating once the novelty bonus inevitably shrinks.
 MINIBATCH_SIZE = 8
 UPDATE_SECONDS_BUDGET = 20.0        # 0 disables the cap
 EPOCHS_PER_UPDATE = 2               # passes over each rollout
-# Optimizer. "adam" is the predictable choice: pair it with the warmup/cosine
-# schedule below and convergence is monotone. "prodigy" needs no learning rate
-# (leave OPTIMIZER_LR at 1.0) but it estimates its own step size, so the decay
-# schedule below fights it; use Prodigy only when you set LR_DECAY_UPDATES high
-# and LR_MIN_FRACTION to 1.0.
-OPTIMIZER_KIND = "adam"             # adam | prodigy
-OPTIMIZER_LR = 3e-4
+# Optimizer: Prodigy, and only Prodigy. It estimates its own step size, so the
+# LR below stays at Prodigy's own 1.0 default rather than a hand-picked rate, and
+# the warmup/cosine schedule is left flat (LR_MIN_FRACTION 1.0) so the decay
+# cannot fight the estimator. A decaying schedule on top of Prodigy is the one
+# combination that reliably fails to converge, which is why nothing here
+# selects an optimizer any more.
+OPTIMIZER_LR = 1.0
 LR_WARMUP_UPDATES = 20              # updates spent ramping the LR up
 LR_DECAY_UPDATES = 5000             # updates over which it cosine-decays
-LR_MIN_FRACTION = 0.1               # floor of the decay, as a fraction of base
+LR_MIN_FRACTION = 1.0               # floor of the decay, as a fraction of base
 GRAD_CLIP_NORM = 1.0                # was 0.5; 1.0 is the PPO default
 # Transformer shape. num_heads must divide VISUAL_DIM.
 VISUAL_DIM = 128
@@ -5066,7 +5067,6 @@ class IntrinsicReward:
         device: torch.device,
         num_actions: int = 16,
         rnd_dim: int = RND_EMBED_DIM,
-        rnd_lr: float = 1e-4,
         w_rnd: float = W_RND,
         w_place: float = W_NOVEL_STATE,
         w_attempt: float = W_NOVEL_PAIR,
@@ -5099,7 +5099,11 @@ class IntrinsicReward:
         for p in self.rnd_target.parameters():
             p.requires_grad_(False)
         self.rnd_pred = make_net().to(device)
-        self.rnd_opt = torch.optim.Adam(self.rnd_pred.parameters(), lr=rnd_lr)
+        # The same optimizer as the policy: Prodigy, at its own 1.0 default.
+        # Extrapolating the right step size from the gradient scale is exactly
+        # what a freshly initialised, constantly shifting novelty target needs,
+        # and it makes the RND nets need no learning rate of their own.
+        self.rnd_opt = Prodigy(self.rnd_pred.parameters(), lr=1.0)
 
         self.rnd_mean, self.rnd_var, self.rnd_count = 0.0, 1e-4, 1e-4
 
@@ -5797,11 +5801,11 @@ def lr_scale_for_update(update_index: int) -> float:
     """
     Warmup then cosine decay, as a multiplier on the optimizer's base LR.
 
-    Prodigy (and Adam) both benefit from this: a raw constant LR either moves
-    too fast at the start, when the value function is still random and the
-    advantages are mostly noise, or never settles at the end, when the novelty
-    bonus has been mined out and the policy should be consolidating. The decay
-    is what turns "it is technically still training" into "it is converging".
+    Prodigy estimates its own step size, so this exists only to soften the very
+    first updates, when the value function is still random and the advantages
+    are mostly noise. LR_MIN_FRACTION is left at 1.0, which makes the post-warmup
+    floor a no-op: the estimator is never fought. Lower it only if you are
+    deliberately trading Prodigy's adaptivity for a hand-tuned decay.
     """
     i = max(0, int(update_index))
     warmup = max(1, int(LR_WARMUP_UPDATES))
@@ -5814,22 +5818,17 @@ def lr_scale_for_update(update_index: int) -> float:
     return lo + (1.0 - lo) * cosine
 
 
-def build_optimizer(params, kind: str = OPTIMIZER_KIND, lr: float = OPTIMIZER_LR):
+def build_optimizer(params, lr: float = OPTIMIZER_LR):
     """
     Central constructor so training and checkpoint-resume can never disagree
-    about which optimizer a run uses.
+    about which optimizer a run uses. There is exactly one: Prodigy.
 
-    Prodigy is kept available because it needs no learning rate at all, but for
-    a long CPU run Adam plus the warmup/cosine schedule below is the more
-    predictable choice: Prodigy estimates its own step size, which means a
-    decay schedule applied on top of it is fighting the estimator.
+    Prodigy measures its own step size against the parameter scale, which is
+    what keeps a long CPU run moving without a hand-picked learning rate. The
+    import at the top of the file is a hard dependency, so Prodigy is always
+    present by the time this is called.
     """
-    kind = str(kind or "adam").strip().lower()
-    if kind == "prodigy":
-        if Prodigy is None:
-            raise RuntimeError("prodigyopt is not installed (pip install prodigyopt)")
-        return Prodigy(params, lr=float(lr))
-    return torch.optim.Adam(params, lr=float(lr), eps=1e-5)
+    return Prodigy(params, lr=float(lr))
 
 
 def set_optimizer_lr(optimizer, base_lrs: List[float], scale: float) -> float:
@@ -5995,8 +5994,11 @@ def train_ppo(
           f"in minibatches of <= {minibatch_size}"
           + (f", {update_seconds_budget:.0f}s budget per update"
              if update_seconds_budget > 0 else ", no update time budget")
-          + f"; LR warmup {LR_WARMUP_UPDATES} then cosine decay to "
-            f"{LR_MIN_FRACTION:.0%} over {LR_DECAY_UPDATES} updates.")
+          + (f"; LR warmup {LR_WARMUP_UPDATES} then cosine decay to "
+             f"{LR_MIN_FRACTION:.0%} over {LR_DECAY_UPDATES} updates."
+             if LR_MIN_FRACTION < 1.0 else
+             f"; LR warmup {LR_WARMUP_UPDATES} then held at the base rate, "
+             f"since Prodigy scales its own steps."))
     opt_name = type(optimizer).__name__
     opt_lr = ", ".join(f"{g.get('lr', 0.0):.2e}" for g in optimizer.param_groups)
     print(f"[Training] Optimizer: {opt_name} (base lr {opt_lr})")
