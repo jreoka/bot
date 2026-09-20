@@ -10,6 +10,10 @@ from pixels, with no knowledge of the game.
     python bot1.py --list-windows  find the handle for --window
     python bot1.py --help          everything else
 
+Training starts idle: click the game window, then press F8 to begin sending
+input, F8 again to pause, F9 to save, F10 to quit. Input is only ever sent while
+the game window has focus, so the terminal stays usable.
+
 The implementation lives in the `botcore` package next to this file. The short
 version of how it works:
 

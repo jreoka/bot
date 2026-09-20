@@ -20,8 +20,33 @@ python bot1.py                # train on your game
   without an enumeration that can never be explored.
 * **Learns** with PPO on a recurrent (CNN + GRU) policy, about 400k parameters.
 * **Rewards itself** intrinsically — see below.
-* **Checkpoints** every few minutes and resumes automatically. `F8` pause,
-  `F9` save, `F10` quit, `Ctrl+C` saves and quits.
+* **Checkpoints** every few minutes and resumes automatically.
+
+## Starting and stopping
+
+The bot does not touch the game until you tell it to. That is deliberate: a
+trainer launched from a terminal that starts injecting straight away types its
+first keys into whatever window happens to be in front — the terminal.
+
+```
+python bot1.py            # idle; prints the target window and waits
+   (click the game so it has focus)
+   F8                     # start  (F8 again pauses, F8 again resumes)
+   F9                     # checkpoint now
+   F10                    # save and quit
+   Ctrl+C                 # save and quit
+```
+
+Input is sent **only while the game window has focus**. Click the terminal, a
+browser, anything else, and the bot immediately lets go of every key and stops
+sending until you click back — it never pulls the desktop back to the game
+after the initial grab, so focus is yours. `--focus always` restores the old
+behaviour of grabbing focus on every action (needed by a few games, and the
+reason a terminal could end up fighting for the keyboard); `--focus never`
+means the bot never touches focus at all. `--start-now` skips the start key.
+
+Checkpoints are written to `checkpoints/` (an older `checkpoints_v2/` directory
+is moved across automatically the first time you run it).
 
 ## Why it does not stall
 
@@ -111,7 +136,7 @@ botcore/
   synth.py           the synthetic game used by --selftest
   calibrate.py       the key recorder behind --calibrate
   diagnostics.py     --list-windows, --check-capture, --benchmark, --release
-  runtime.py         checkpoints, hotkeys, Ctrl+C, process priority
+  runtime.py         checkpoints, hotkeys, the start key, Ctrl+C, priority
   cli.py             argument parsing and the mode dispatch
 ```
 

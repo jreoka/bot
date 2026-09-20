@@ -529,6 +529,11 @@ class GameSession:
         it is None the loop simply runs.  `save_fn(reason)` is called when a
         checkpoint is due.
         """
+        if control is not None and not self.wait_for_start(control):
+            return
+        # One attempt at the foreground window, now that the user has said
+        # "go". Per the focus policy this never happens again on its own.
+        self.focus_env()
         self.reset(seed=self.cfg.seed)
         last_status = self.total_steps
 
@@ -551,6 +556,7 @@ class GameSession:
                         self.release_held()
                         time.sleep(0.05)
                     self.resume_env()
+                    self.focus_env()
                     # The world moved on while paused, so the recurrent state
                     # and the pending observation are no longer a chain.
                     self.observation = self._current_observation()
@@ -612,6 +618,56 @@ class GameSession:
                 self.status_block()
 
     # ---- environment control ----
+    def wait_for_start(self, control) -> bool:
+        """
+        Block until the user presses the start key. Returns False if they quit
+        instead.
+
+        Nothing at all is sent before this, which is what makes the sequence
+        "start the script, click the game, press the start key" safe: the bot
+        cannot type into whichever window happened to have focus at launch.
+        A control object without the gate (or with it already satisfied) starts
+        immediately, so this is a no-op for the self-test and for --start-now.
+        """
+        gate = getattr(control, "awaiting_start", False)
+        awaiting = bool(gate() if callable(gate) else gate)
+        if not awaiting:
+            return True
+        key = str(getattr(self.cfg, "hotkey_pause", "f8")).upper()
+        self._print("")
+        self._print(f"[Control] Ready. Click the game window so it has focus, "
+                    f"then press {key} to start.")
+        self._print("[Control] Nothing is being sent until then, so it is safe "
+                    "to use the terminal.")
+        while control.awaiting_start and not control.stop_requested:
+            for message in control.service():
+                self._print(f"[Control] {message}")
+            time.sleep(0.05)
+        if control.stop_requested:
+            self._print("[Control] Quit before starting; nothing was sent.")
+            return False
+        return True
+
+    def focus_env(self) -> None:
+        """
+        Let the environment bring its window forward, once.
+
+        Deliberately not per step: an injector that grabs the foreground on
+        every action is an injector that fights the user for the keyboard.
+        """
+        acquire = getattr(self.env, "acquire_focus", None)
+        if callable(acquire):
+            try:
+                focused = acquire()
+            except Exception as exc:
+                self._print(f"[Control] Could not focus the game window: {exc}")
+                return
+            if focused is False:
+                self._print("[Control] The game window could not be brought "
+                            "forward (Windows allows that only from the "
+                            "foreground app). Click the game - input starts on "
+                            "its own once the game has focus.")
+
     def _current_observation(self) -> np.ndarray:
         """Ask the environment for a fresh observation, if it can give one."""
         getter = getattr(self.env, "_get_obs", None)

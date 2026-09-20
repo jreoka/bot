@@ -52,7 +52,8 @@ from .config import ARCH_NAME, REWARD_VERSION, Config
 from .diagnostics import (benchmark, check_capture, list_windows, preflight,
                           release_all_keys, show_actions)
 from .keys import ActionSpace, Keymap
-from .runtime import CheckpointManager, SignalController, lower_process_priority
+from .runtime import (CheckpointManager, SignalController,
+                      lower_process_priority, migrate_legacy_checkpoint_dir)
 from .session import GameSession, atomic_save, load_checkpoint
 
 
@@ -140,6 +141,14 @@ def build_parser() -> argparse.ArgumentParser:
                         help="ignore any existing checkpoint and start over")
     parser.add_argument("--no-hotkeys", action="store_true",
                         help="disable the global pause/save/quit keys")
+    parser.add_argument("--start-now", action="store_true",
+                        help="start injecting immediately instead of waiting "
+                             "for the start key (F8)")
+    parser.add_argument("--focus", default=cfg.focus_policy,
+                        choices=["once", "always", "never"],
+                        help="how hard the bot may fight for the game's focus: "
+                             "once at start (default), always (grabs it back "
+                             "every action), never")
     parser.add_argument("--priority", default=cfg.priority,
                         choices=["below_normal", "idle", "normal", "high"])
     parser.add_argument("--log", default=None,
@@ -179,6 +188,8 @@ def config_from_args(args: argparse.Namespace) -> Config:
         checkpoint_keep=args.keep,
         resume=not args.fresh,
         enable_hotkeys=not args.no_hotkeys,
+        wait_for_start=not args.start_now,
+        focus_policy=args.focus,
         priority=args.priority,
         log_json=args.log,
         preview=args.preview,
@@ -322,6 +333,12 @@ def run_training(cfg: Config, args) -> int:
     env = RealGameEnv(cfg, cfg.window_hwnd, space, dry_run=args.dry_run)
     session = GameSession(cfg, env, space, keymap=keymap)
 
+    # The checkpoint directory lost its "_v2" suffix; move a previous default
+    # directory across rather than "finding nothing" and starting over.
+    moved = migrate_legacy_checkpoint_dir(cfg.checkpoint_dir)
+    if moved:
+        print(f"[Checkpoint] Moved the old checkpoint directory to '{moved}'.")
+
     checkpoint_manager = CheckpointManager(cfg.checkpoint_dir, cfg.checkpoint_keep)
     resumed = False
     if cfg.resume:
@@ -346,7 +363,18 @@ def run_training(cfg: Config, args) -> int:
     print(f"  {parameters:,} parameters, torch threads "
           f"{torch.get_num_threads()}")
     print("-" * 74)
-    print("  F8 pause | F9 save | F10 quit | Ctrl+C save and quit")
+    start_key = str(cfg.hotkey_pause).upper()
+    if cfg.wait_for_start:
+        print(f"  The bot is idle and sends nothing until you press "
+              f"{start_key}.")
+        print(f"  Click the game window first, then press {start_key} to start.")
+    else:
+        print("  Starting immediately (--start-now).")
+    print(f"  {start_key} start/pause | {str(cfg.hotkey_save).upper()} save | "
+          f"{str(cfg.hotkey_quit).upper()} quit | Ctrl+C save and quit")
+    print("  Input is sent only while the game window has focus; if you click "
+          "elsewhere")
+    print("  the bot holds nothing and resumes the moment you click back.")
     print(f"  Checkpoint every {cfg.checkpoint_interval_sec / 60:.1f} min, "
           f"keeping {cfg.checkpoint_keep} in '{cfg.checkpoint_dir}'")
     print("  Stop at any time; running it again continues from where it was.")
@@ -379,8 +407,13 @@ def run_training(cfg: Config, args) -> int:
     except KeyboardInterrupt:
         print("\n[Run] Interrupted.")
     finally:
-        print("[Run] Saving a final checkpoint...")
-        save("final")
+        if session.decisions:
+            print("[Run] Saving a final checkpoint...")
+            save("final")
+        else:
+            # Quit before the start key, so nothing was sent and nothing
+            # changed - writing a checkpoint here would only prune a good one.
+            print("[Run] Nothing was sent, so no checkpoint was written.")
         session.close()
 
     print()

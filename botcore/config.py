@@ -259,7 +259,7 @@ class Config:
     # =====================================================================
     # Checkpointing
     # =====================================================================
-    checkpoint_dir: str = "checkpoints_v2"
+    checkpoint_dir: str = "checkpoints"
     checkpoint_interval_sec: float = 300.0
     checkpoint_keep: int = 3
     resume: bool = True
@@ -268,10 +268,26 @@ class Config:
     # =====================================================================
     # Control / housekeeping
     # =====================================================================
+    # F8 starts the run and then pauses/resumes it. Starting on a key rather
+    # than at launch is deliberate: the bot must not send a single keystroke
+    # until the user has clicked the game, or the first keys land in whatever
+    # window had focus when the script was launched - usually the terminal.
     hotkey_pause: str = "f8"
     hotkey_save: str = "f9"
     hotkey_quit: str = "f10"
     enable_hotkeys: bool = True
+    # True: wait for the start key (F8) before touching the game. False:
+    # start injecting immediately (--start-now).
+    wait_for_start: bool = True
+    # How hard the bot may fight for the foreground window:
+    #   "once"   - bring the game forward when a run starts or resumes, then
+    #              leave the desktop alone. If the game loses focus, input
+    #              stops until it comes back, so keys never land elsewhere.
+    #   "always" - re-assert focus on every action. This is what makes the
+    #              terminal and the game wrestle for the keyboard; kept only
+    #              for games that will not accept input any other way.
+    #   "never"  - never touch focus; the user brings the game forward.
+    focus_policy: str = "once"
     # Threads torch may use. Deliberately 1: this model is small enough that
     # the per-op thread hand-off costs more than the parallelism saves. It was
     # measured at 4.6 ms/step on one thread against 6.1 ms on four and 10.1 ms
@@ -310,6 +326,10 @@ class Config:
             raise ValueError("embed_dim must be divisible by 4")
         if self.hidden_dim < 4:
             raise ValueError("hidden_dim must be at least 4")
+        if self.focus_policy not in ("once", "always", "never"):
+            raise ValueError(
+                f"focus_policy '{self.focus_policy}' is not one of "
+                f"'once', 'always', 'never'")
         return self
 
     @property

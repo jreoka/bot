@@ -50,7 +50,8 @@ class RealGameEnv:
         self.grabber = FrameGrabber(self.hwnd)
         self.stack = FrameStack(cfg.frame_size, cfg.frame_stack)
         self.pacer = Pacer(cfg.target_fps, cfg.capture_delay)
-        self.input = InputInjector(self.hwnd)
+        self.input = InputInjector(
+            self.hwnd, focus_policy=getattr(cfg, "focus_policy", "once"))
 
         self.observation_shape = (self.stack.channels, cfg.frame_size,
                                   cfg.frame_size)
@@ -132,11 +133,30 @@ class RealGameEnv:
     def resume(self) -> None:
         self.input.suspended = False
 
+    def acquire_focus(self) -> bool:
+        """Ask for the foreground window once (run start, resume from pause)."""
+        if self.dry_run or self.input.focus_policy == "never":
+            # A dry run touches nothing, and "never" means the user brings the
+            # game forward: neither is a failure to report.
+            return True
+        return self.input.acquire_focus(force=True)
+
+    @property
+    def focused(self) -> bool:
+        """Is the game the window that would receive injected input?"""
+        return self.input.focused()
+
     # =====================================================================
     # Environment API
     # =====================================================================
     def step(self, action: Dict) -> Tuple[np.ndarray, bool, Dict]:
-        if self.paused_by_user:
+        if not self.dry_run and not self.input.focused():
+            # Nothing is injected into a window that is not in front: the keys
+            # would land in whatever is - for a bot launched from a terminal,
+            # the terminal, which then keeps stealing the keyboard back. Hold
+            # nothing and wait; `begin_action` explains it once.
+            self.release_all()
+        elif self.paused_by_user:
             self.release_all()
         else:
             self.set_held(action.get("held_vks") or [])
@@ -183,6 +203,13 @@ class RealGameEnv:
         return 1000.0 * self.total_capture_seconds / max(1, self.steps)
 
     def close(self) -> None:
+        if self._held:
+            # One last attempt at the foreground window, so the key-ups below
+            # actually reach the game rather than a window that took over.
+            try:
+                self.input.acquire_focus(force=True)
+            except Exception:
+                pass
         self.release_all()
         try:
             self.grabber.close()

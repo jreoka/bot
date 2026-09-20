@@ -14,6 +14,7 @@ import ctypes
 import json
 import os
 import queue
+import shutil
 import signal
 import threading
 import time
@@ -173,6 +174,41 @@ class HotkeyController:
                          if a in self._registered)
 
 
+# Checkpoint directories this build used to write to by default. Without a
+# one-time move, a run made before the rename would look like "no checkpoint
+# found" and be silently replaced by a fresh one, which costs hours of training.
+LEGACY_CHECKPOINT_DIRS = ("checkpoints_v2",)
+
+
+def migrate_legacy_checkpoint_dir(directory: str,
+                                  legacy=LEGACY_CHECKPOINT_DIRS
+                                  ) -> Optional[str]:
+    """
+    Move an old default checkpoint directory to the current name, once.
+
+    Returns the new path when something was moved, else None. Never merges and
+    never overwrites: if the current directory already exists it is left alone.
+    """
+    target = os.path.abspath(directory) if directory else ""
+    if not target or os.path.exists(target):
+        return None
+    for name in legacy:
+        source = os.path.abspath(name)
+        if source == target or not os.path.isdir(source):
+            continue
+        try:
+            os.replace(source, target)
+        except OSError:
+            try:
+                shutil.move(source, target)
+            except Exception as exc:
+                print(f"[Checkpoint] Could not move '{source}' to "
+                      f"'{target}': {exc}")
+                return None
+        return target
+    return None
+
+
 class CheckpointManager:
     """Atomic, pruned checkpoints plus a rolling resume file."""
 
@@ -323,6 +359,10 @@ class SignalController:
 
     def __init__(self, cfg: Config):
         self.interval = max(0.05, float(cfg.checkpoint_interval_sec))
+        # A run that waits for the start key injects nothing until it is
+        # pressed, so launching the script cannot type into the terminal.
+        self.wait_for_start = bool(getattr(cfg, "wait_for_start", True))
+        self._started = not self.wait_for_start
         self._paused = False
         self._stop = False
         self._manual_save = False
@@ -350,6 +390,14 @@ class SignalController:
                 for message in self.hotkeys.drain_messages():
                     print(f"[Hotkeys] {message}")
                 print("[Hotkeys] No global hotkeys; Ctrl+C still saves and quits.")
+        if self.wait_for_start and (self.hotkeys is None
+                                    or not self.hotkeys.available):
+            # Without a global start key there would be no way to start at all,
+            # so the gate is dropped rather than leaving the run stuck.
+            self._started = True
+            self.wait_for_start = False
+            print("[Control] The start key is unavailable, so the run starts "
+                  "immediately.")
         for name in ("SIGINT", "SIGBREAK"):
             sig = getattr(signal, name, None)
             if sig is None:
@@ -380,6 +428,14 @@ class SignalController:
                 print(f"[Hotkeys] {message}")
             for action in self.hotkeys.poll():
                 if action == "pause":
+                    if not self._started:
+                        # The first press is the start, not a resume.
+                        self._started = True
+                        self._paused = False
+                        self._pause_notice = True
+                        notes.append("STARTING - the bot has the keyboard now. "
+                                     "Press the same key again to pause.")
+                        continue
                     self._paused = not self._paused
                     self._pause_notice = False
                     notes.append("PAUSED - no input is being sent."
@@ -396,6 +452,11 @@ class SignalController:
     @property
     def paused(self) -> bool:
         return self._paused
+
+    @property
+    def awaiting_start(self) -> bool:
+        """True until the start key has been pressed (Config.wait_for_start)."""
+        return self.wait_for_start and not self._started
 
     @property
     def stop_requested(self) -> bool:

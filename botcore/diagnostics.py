@@ -62,6 +62,9 @@ def release_all_keys(cfg: Config, hwnd: int) -> int:
     keymap = Keymap.load(cfg.keymap_path) or Keymap.default()
     injector = InputInjector(hwnd)
     print("[Release] Lifting every key in the whitelist and all mouse buttons.")
+    # The key-ups have to land in the game, so ask for its focus once; if that
+    # fails they still go out, which is better than leaving a key down.
+    injector.acquire_focus(force=True)
     injector.begin_action()
     for name, vk in list(keymap.vks.items()):
         injector.release_vk(int(vk))

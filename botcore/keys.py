@@ -435,8 +435,16 @@ class InputInjector:
     Mouse-look is deliberately a real cursor delta through SendInput: games
     read look from raw relative mouse motion, so a message-based approach
     cannot turn the view at all.  That also means the game window must be
-    focused, which is why focus is re-asserted once per action rather than once
-    per key.
+    focused, which is why this object watches the foreground window rather than
+    assuming it.
+
+    **Focus is checked, not fought for.**  Input is only sent while the game is
+    the foreground window; ``focus_policy`` decides whether the bot may take
+    focus at all ("once" - when a run starts or resumes; "always" - on every
+    action, which is what makes the terminal and the game wrestle for the
+    keyboard; "never").  Sending keys at a window that is not in front does not
+    reach the game - it goes to whatever *is* in front, which for a bot started
+    from a terminal means the terminal itself.
 
     ``suspended`` is the soft switch used while the user has the controls:
     while it is set, this object injects nothing and says nothing, because it
@@ -445,23 +453,50 @@ class InputInjector:
     about.
     """
 
-    def __init__(self, hwnd: int):
+    POLICIES = ("once", "always", "never")
+
+    def __init__(self, hwnd: int, focus_policy: str = "once"):
         require_windows("Input injection")
         self.hwnd = int(hwnd)
+        self.focus_policy = (focus_policy if focus_policy in self.POLICIES
+                             else "once")
         self.suspended = False
         self.enabled = True
         self.blocked = 0
         self.failures = 0
+        self.skipped_unfocused = 0
         self.last_error: Optional[str] = None
         self._focused = False
+        self._focus_attempted = False
         self._focus_warned = False
         self._structs = None
         self.transient_vks: set = set()
 
     # ---- focus ----
-    def _ensure_focus(self) -> bool:
-        if win32gui.GetForegroundWindow() == self.hwnd:
+    def focused(self) -> bool:
+        """Would Windows deliver injected input to the game window?"""
+        try:
+            return win32gui.GetForegroundWindow() == self.hwnd
+        except Exception:
+            # Fail open: an API hiccup must not silently stop the bot.
             return True
+
+    def acquire_focus(self, force: bool = False) -> bool:
+        """
+        Bring the game window forward. Called at start and on resume, not per
+        step, so the desktop is not repeatedly yanked out from under the user.
+
+        ``force`` asks for one attempt even under the "once" policy.
+        """
+        if self.focused():
+            self._focused = True
+            self._focus_warned = False
+            return True
+        if self.focus_policy == "never":
+            return False
+        if not force and self.focus_policy == "once" and self._focus_attempted:
+            return False
+        self._focus_attempted = True
         try:
             win32gui.SetForegroundWindow(self.hwnd)
         except Exception:
@@ -473,21 +508,40 @@ class InputInjector:
                 fg = win32gui.GetForegroundWindow()
                 fg_thread = win32process.GetWindowThreadProcessId(fg)[0]
                 my_thread = ctypes.windll.kernel32.GetCurrentThreadId()
-                ctypes.windll.user32.AttachThreadInput(my_thread, fg_thread, True)
-                win32gui.SetForegroundWindow(self.hwnd)
-                ctypes.windll.user32.AttachThreadInput(my_thread, fg_thread, False)
+                attached = bool(ctypes.windll.user32.AttachThreadInput(
+                    my_thread, fg_thread, True))
+                try:
+                    win32gui.SetForegroundWindow(self.hwnd)
+                finally:
+                    # Always detach: a leaked attachment couples this thread's
+                    # input queue to the other window's, and focus then behaves
+                    # strangely for every window afterwards.
+                    if attached:
+                        ctypes.windll.user32.AttachThreadInput(
+                            my_thread, fg_thread, False)
             except Exception:
                 return False
-        return win32gui.GetForegroundWindow() == self.hwnd
+        self._focused = self.focused()
+        if self._focused:
+            self._focus_warned = False
+        return self._focused
 
     def begin_action(self) -> None:
+        """Called before a batch of input; decides whether it may be sent."""
+        self._focused = self.focused()
         if self._focused:
+            if self._focus_warned:
+                self._focus_warned = False
+                print("[Input] The game window is focused again; input resumed.",
+                      flush=True)
             return
-        self._focused = self._ensure_focus()
-        if not self._focused and not self._focus_warned:
+        if self.focus_policy == "always" and self.acquire_focus(force=True):
+            return
+        if not self._focus_warned:
             self._focus_warned = True
-            print("[Input] WARNING: could not focus the game window, so input "
-                  "will not reach it. Click the game once.")
+            print("[Input] The game window is not focused, so nothing is being "
+                  "sent. Click the game - input resumes on its own. (The "
+                  "terminal can be used normally meanwhile.)", flush=True)
 
     def end_action(self) -> None:
         self._focused = False
@@ -521,17 +575,25 @@ class InputInjector:
 
         return KEYBDINPUT, MOUSEINPUT, INPUT
 
-    def _may_inject(self, what: str) -> bool:
+    def _may_inject(self, what: str, forcing: bool = False) -> bool:
         if not self.enabled:
             self.blocked += 1
             if self.blocked <= 5:
                 print(f"[Input] BLOCKED injection ({what}): input is disabled "
                       f"in this mode. This is a bug.")
             return False
-        return not self.suspended
+        if self.suspended:
+            return False
+        if not forcing and not self._focused:
+            # No focus, no input: a key sent now would land in some other
+            # window, and the game would never see it.
+            self.skipped_unfocused += 1
+            return False
+        return True
 
-    def _send_key(self, vk: int, up: bool) -> None:
-        if not self._may_inject(f"vk 0x{int(vk):02X} {'up' if up else 'down'}"):
+    def _send_key(self, vk: int, up: bool, forcing: bool = False) -> None:
+        if not self._may_inject(f"vk 0x{int(vk):02X} {'up' if up else 'down'}",
+                                forcing=forcing):
             return
         if self._structs is None:
             self._structs = self._input_structs()
@@ -549,8 +611,10 @@ class InputInjector:
             self.failures += 1
             self.last_error = f"SendInput(key) failed, err={ctypes.get_last_error()}"
 
-    def _send_mouse(self, dx: int, dy: int, flags: int) -> None:
-        if not self._may_inject(f"mouse dx={dx} dy={dy} flags=0x{flags:04X}"):
+    def _send_mouse(self, dx: int, dy: int, flags: int,
+                    forcing: bool = False) -> None:
+        if not self._may_inject(f"mouse dx={dx} dy={dy} flags=0x{flags:04X}",
+                                forcing=forcing):
             return
         if self._structs is None:
             self._structs = self._input_structs()
@@ -570,8 +634,11 @@ class InputInjector:
             self._send_key(int(vk), False)
 
     def release_vk(self, vk: int) -> None:
+        # Releases are always sent, focused or not: a key left down is worse
+        # than a key-up delivered to the wrong window (a key-up for a key that
+        # is not down does nothing).
         if vk:
-            self._send_key(int(vk), True)
+            self._send_key(int(vk), True, forcing=True)
 
     def tap_vk(self, vk: int, seconds: float = 0.05) -> None:
         """Down, hold briefly, up. The key is noted while it is physically down."""
@@ -597,7 +664,9 @@ class InputInjector:
     def mouse_up(self, button: str) -> None:
         flag = {"left": 0x0004, "right": 0x0010, "middle": 0x0040}.get(button)
         if flag:
-            self._send_mouse(0, 0, flag)
+            # Forced for the same reason as a key release: never leave a
+            # button down because the window lost focus mid-click.
+            self._send_mouse(0, 0, flag, forcing=True)
 
     def click(self, button: str, seconds: float = 0.05) -> None:
         vk = MOUSE_BUTTON_VK.get(button)
