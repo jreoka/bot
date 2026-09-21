@@ -60,11 +60,14 @@ pub struct Injector {
     pub keys_sent: u64,
     pub mouse_sent: u64,
     pub last_error: Option<String>,
+    /// Accepted for the shared call site and ignored here, like everything else:
+    /// there is no window to confine a cursor to.
+    pub clip_cursor: bool,
     announced: bool,
 }
 
 impl Injector {
-    pub fn new(_handle: crate::platform::Handle, policy: FocusPolicy) -> Self {
+    pub fn new(_handle: crate::platform::Handle, policy: FocusPolicy, clip_cursor: bool) -> Self {
         Self {
             policy,
             suspended: false,
@@ -76,6 +79,7 @@ impl Injector {
             keys_sent: 0,
             mouse_sent: 0,
             last_error: Some(reason()),
+            clip_cursor,
             announced: false,
         }
     }

@@ -94,7 +94,7 @@ impl RealGameEnv {
             grabber: platform::FrameGrabber::new(handle),
             stack,
             pacer: Pacer::new(cfg.target_fps, cfg.capture_delay, cfg.action_repeat),
-            input: platform::Injector::new(handle, cfg.focus_policy),
+            input: platform::Injector::new(handle, cfg.focus_policy, cfg.clip_cursor),
             label: WindowLabel::default(),
             shape,
             gray_channels: cfg.frame_stack,
@@ -282,6 +282,11 @@ impl Environment for RealGameEnv {
             for vk in held {
                 self.input.release_vk(vk);
             }
+            // Closed, not left open: `end_action` is where the cursor a mouse
+            // move claimed is let go, and this path runs when the bot is
+            // suspending or stopping - exactly when the user needs their mouse
+            // back.
+            self.input.end_action();
         }
         self.held.clear();
     }

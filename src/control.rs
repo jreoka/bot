@@ -150,6 +150,12 @@ impl Control for SignalController {
                 } else {
                     messages.push("[Signal] Second interrupt - exiting now.".to_string());
                     println!("{}", messages.last().cloned().unwrap_or_default());
+                    // This path deliberately does not unwind, so the injector's
+                    // own release never runs. The cursor is the one piece of
+                    // global state that would otherwise be left behind, and a
+                    // user who asked twice for the bot to stop is the last
+                    // person who should have to fight it for their mouse.
+                    crate::platform::free_cursor_clip();
                     std::process::exit(130);
                 }
             }

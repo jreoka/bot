@@ -152,9 +152,13 @@ pub fn list_windows() -> i32 {
 }
 
 /// Straighten out a key left down, and every mouse button with it.
+///
+/// A cursor left confined to a window is repaired here too: it is the other
+/// piece of desktop-wide state a run that died can leave behind, and it is the
+/// state a user notices first, because it takes their mouse away.
 pub fn release_all_keys(cfg: &Config, handle: Handle) -> i32 {
     let keymap = Keymap::load(&cfg.keymap_path).unwrap_or_else(Keymap::default_layout);
-    let mut injector = platform::Injector::new(handle, cfg.focus_policy);
+    let mut injector = platform::Injector::new(handle, cfg.focus_policy, cfg.clip_cursor);
     println!("[Release] Lifting every key in the whitelist and all mouse buttons.");
     injector.acquire_focus(true);
     injector.begin_action();
@@ -165,7 +169,11 @@ pub fn release_all_keys(cfg: &Config, handle: Handle) -> i32 {
         injector.release_vk(code);
     }
     injector.end_action();
-    println!("[Release] Done.");
+    // Unconditional, and last: not "a clip this call took", but "nothing is
+    // holding the cursor" - the repair is for the run that died, not for this
+    // one, which never confined anything.
+    platform::free_cursor_clip();
+    println!("[Release] Done. The cursor is free to move anywhere again.");
     0
 }
 

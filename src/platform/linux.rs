@@ -134,6 +134,15 @@ pub fn is_supported() -> bool {
     connect().is_ok()
 }
 
+/// Nothing here confines a cursor to a window, so there is nothing to give back.
+///
+/// X11 has the mechanism - `XGrabPointer` with `confine_to` - but a grab is
+/// exclusive: it collides with the one a game already holds on its own window
+/// and can leave the pointer frozen for every other client if it fails
+/// half-way. Confining the pointer is left to the game, and the injector says so
+/// once at the first action rather than this being silent.
+pub fn free_cursor_clip() {}
+
 pub fn capability_report() -> Vec<String> {
     let mut report = Vec::new();
     if !is_x11() {
@@ -726,12 +735,16 @@ pub struct Injector {
     focus_warned: bool,
     focus_notice_at: std::time::Instant,
     pub transient_vks: HashSet<u32>,
+    /// Accepted for the shared call site; confinement is not implemented on X11,
+    /// and `begin_action` says so once rather than pretending.
+    pub clip_cursor: bool,
+    clip_notice: bool,
     keycode_cache: std::collections::HashMap<u32, u8>,
     announced: bool,
 }
 
 impl Injector {
-    pub fn new(handle: Handle, policy: crate::config::FocusPolicy) -> Self {
+    pub fn new(handle: Handle, policy: crate::config::FocusPolicy, clip_cursor: bool) -> Self {
         let (connection, screen_num, error) = match connect() {
             Ok((connection, screen_num)) => (Some(connection), screen_num, None),
             Err(error) => (None, 0, Some(error)),
@@ -755,6 +768,8 @@ impl Injector {
             focus_warned: false,
             focus_notice_at: std::time::Instant::now(),
             transient_vks: HashSet::new(),
+            clip_cursor,
+            clip_notice: false,
             keycode_cache: std::collections::HashMap::new(),
             announced: false,
         }
@@ -827,6 +842,18 @@ impl Injector {
             if self.focus_warned {
                 self.focus_warned = false;
                 println!("[Input] The game window is focused again; input resumed.");
+            }
+            // Said once, at the first action of a real run: this is the one gap
+            // in this backend that shows up as input landing in the wrong place
+            // rather than as nothing happening.
+            if self.clip_cursor && !self.clip_notice {
+                self.clip_notice = true;
+                println!(
+                    "[Input] Cursor confinement is not implemented on X11, so a game that \
+                     frees the cursor (an inventory, a pause menu) can still have the pointer \
+                     walk out of the window and a click land outside it. --no-clip-cursor \
+                     silences this."
+                );
             }
             return;
         }

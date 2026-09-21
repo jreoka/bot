@@ -184,6 +184,22 @@ pub struct Config {
     pub enable_hotkeys: bool,
     pub wait_for_start: bool,
     pub focus_policy: FocusPolicy,
+    /// Keep the OS cursor inside the game window while the bot is moving it or
+    /// clicking.
+    ///
+    /// A game frees the cursor when it opens a menu - an inventory, a pause
+    /// screen - and then reads the *real* pointer rather than a raw delta. The
+    /// bot's relative mouse steps are not clamped by anything, so at twenty
+    /// decisions a second the pointer walks off the window within a second and
+    /// the next click lands on whatever is under it: the terminal, a browser,
+    /// the desktop. Confining it (Win32 `ClipCursor`) keeps every injected move
+    /// and click inside the game. It is claimed only while the bot is actually
+    /// injecting, and released the moment it stops, because the cursor is
+    /// shared with the user.
+    ///
+    /// Windows only for now: the other backends accept the flag and say so
+    /// rather than pretending, exactly as they do for the rest of their gaps.
+    pub clip_cursor: bool,
     /// Threads the tensor backend may use. 1 in the Python build, for the reason
     /// recorded in `config.py`: this model is small enough that the per-op
     /// thread hand-off costs more than the parallelism saves. Kept as its own
@@ -291,6 +307,7 @@ impl Default for Config {
             enable_hotkeys: true,
             wait_for_start: true,
             focus_policy: FocusPolicy::Once,
+            clip_cursor: true,
             torch_threads: 1,
             priority: Priority::BelowNormal,
             preview: false,
@@ -490,6 +507,7 @@ impl Config {
         env_bool!(prefer_game_window);
         env_bool!(enable_hotkeys);
         env_bool!(wait_for_start);
+        env_bool!(clip_cursor);
         env_bool!(resume);
         env_bool!(preview);
         env_bool!(show_model);

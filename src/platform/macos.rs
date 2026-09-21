@@ -118,6 +118,14 @@ pub fn is_supported() -> bool {
     true
 }
 
+/// Nothing here confines a cursor to a window, so there is nothing to give back.
+///
+/// macOS would do it by disassociating the cursor from mouse motion
+/// (`CGAssociateMouseAndMouseCursorPosition(false)`) and warping it back, which
+/// is a bigger change to how this injector moves the pointer than the Windows
+/// clip is; see `Injector::begin_action`, which is where the gap is reported.
+pub fn free_cursor_clip() {}
+
 pub fn capability_report() -> Vec<String> {
     let mut report = Vec::new();
     if has_screen_recording() {
@@ -696,12 +704,16 @@ pub struct Injector {
     focus_warned: bool,
     focus_notice_at: std::time::Instant,
     pub transient_vks: HashSet<u32>,
+    /// Accepted for the shared call site; confinement is not implemented here,
+    /// and `begin_action` says so once rather than pretending.
+    pub clip_cursor: bool,
+    clip_notice: bool,
     position: Option<(f64, f64)>,
     warned: bool,
 }
 
 impl Injector {
-    pub fn new(handle: Handle, policy: crate::config::FocusPolicy) -> Self {
+    pub fn new(handle: Handle, policy: crate::config::FocusPolicy, clip_cursor: bool) -> Self {
         Self {
             handle,
             source: CGEventSource::new(CGEventSourceStateID::CombinedSessionState).ok(),
@@ -720,6 +732,8 @@ impl Injector {
             focus_warned: false,
             focus_notice_at: std::time::Instant::now(),
             transient_vks: HashSet::new(),
+            clip_cursor,
+            clip_notice: false,
             position: None,
             warned: false,
         }
@@ -768,6 +782,18 @@ impl Injector {
             if self.focus_warned {
                 self.focus_warned = false;
                 println!("[Input] The game window is focused again; input resumed.");
+            }
+            // Said once, at the first action of a real run: with the cursor free
+            // (an inventory), the bot's own accumulated pointer position is what
+            // a click lands on, and nothing here holds it inside the window.
+            if self.clip_cursor && !self.clip_notice {
+                self.clip_notice = true;
+                println!(
+                    "[Input] Cursor confinement is not implemented on macOS, so a game that \
+                     frees the cursor (an inventory, a pause menu) can still have the pointer \
+                     walk out of the window and a click land outside it. --no-clip-cursor \
+                     silences this."
+                );
             }
             return;
         }

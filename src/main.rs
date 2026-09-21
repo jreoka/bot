@@ -86,6 +86,10 @@ fn train(arguments: &[String]) -> anyhow::Result<()> {
         seed: value_of("--seed", 0),
         enable_hotkeys: !has("--no-hotkeys"),
         wait_for_start: !has("--start-now"),
+        // On by default: a game that frees the cursor (an inventory, a pause
+        // menu) lets the bot's own mouse steps walk the pointer out of the
+        // window, and the next click lands on whatever is under it.
+        clip_cursor: !has("--no-clip-cursor"),
         ..bot1::Config::default()
     }
     .env_overrides();
@@ -585,7 +589,11 @@ fn print_help() {
          \x20 --platform    what this build can and cannot do on this OS\n\
          \n\
          Options: --seed N, --steps N, --window N, --fps N, --focus once|always|never,\n\
-         \x20 --no-hotkeys, --start-now, --pick, --dry-run, --decisions N.\n\
+         \x20 --no-hotkeys, --no-clip-cursor, --start-now, --pick, --dry-run, --decisions N.\n\
+         \n\
+         The cursor is confined to the game window while the bot moves it, so a game\n\
+         that frees the cursor (an inventory) cannot have clicks land outside it;\n\
+         --no-clip-cursor turns that off, and BOT_CLIP_CURSOR=0 does the same.\n\
          \n\
          Every key is released on exit, including on Ctrl+C. Nothing is sent while the\n\
          game window is not in front, and the bot refuses to drive its own terminal.",

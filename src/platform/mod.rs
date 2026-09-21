@@ -472,6 +472,16 @@ pub fn capability_report() -> Vec<String> {
     current::capability_report()
 }
 
+/// Give the user their cursor back, whatever is holding it.
+///
+/// The injector releases its own confinement on the way out, including from a
+/// panic. This is the version for the exits that do not unwind - the second
+/// Ctrl+C, and the release path that cleans up after a run that died - because a
+/// cursor clip is desktop-wide state and nothing else here will undo it.
+pub fn free_cursor_clip() {
+    current::free_cursor_clip();
+}
+
 /// Whether this build can actually drive a window on this machine.
 pub fn is_supported() -> bool {
     current::is_supported()

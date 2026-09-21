@@ -21,6 +21,9 @@ pub fn is_supported() -> bool {
     false
 }
 
+/// Nothing here confines a cursor, so there is nothing to give back.
+pub fn free_cursor_clip() {}
+
 pub fn capability_report() -> Vec<String> {
     vec![
         format!(

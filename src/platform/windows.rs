@@ -14,7 +14,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 
-use windows::Win32::Foundation::{CloseHandle, HWND, LPARAM, MAX_PATH, RECT, WPARAM};
+use windows::Win32::Foundation::{CloseHandle, HWND, LPARAM, MAX_PATH, POINT, RECT, WPARAM};
 use windows::Win32::System::Console::GetConsoleWindow;
 use windows::Win32::System::Diagnostics::ToolHelp::{
     CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW, TH32CS_SNAPPROCESS,
@@ -24,8 +24,9 @@ use windows::Win32::System::Threading::{
     QueryFullProcessImageNameW,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    CallNextHookEx, EnumWindows, GetClientRect, GetForegroundWindow, GetWindowRect, GetWindowTextW,
-    GetWindowThreadProcessId, HHOOK, IsIconic, IsWindow, IsWindowVisible,
+    CallNextHookEx, ClipCursor, EnumWindows, GetClientRect, GetCursorPos, GetForegroundWindow,
+    GetWindowRect, GetWindowTextW, GetWindowThreadProcessId, HHOOK, IsIconic, IsWindow,
+    IsWindowVisible, SetCursorPos,
 };
 use windows::core::PWSTR;
 
@@ -114,7 +115,12 @@ pub fn is_supported() -> bool {
 }
 
 pub fn capability_report() -> Vec<String> {
-    Vec::new()
+    vec![
+        "Cursor confinement is available: while the bot moves the mouse or clicks, the \
+         cursor is kept inside the game window, so a game that frees it (an inventory) \
+         cannot have the click land outside. --no-clip-cursor turns it off."
+            .to_string(),
+    ]
 }
 
 fn window_text(hwnd: HWND) -> String {
@@ -378,10 +384,19 @@ pub struct Injector {
     focus_warned: bool,
     focus_notice_at: std::time::Instant,
     pub transient_vks: HashSet<u32>,
+    /// Whether the cursor is confined to the game window while the bot moves it
+    /// or clicks. See [`crate::Config::clip_cursor`].
+    pub clip_cursor: bool,
+    /// Whether *this* injector is holding the cursor right now. The release is
+    /// conditional on purpose: `ClipCursor(NULL)` is desktop-wide, so releasing
+    /// a clip this injector never took would throw away one the game is holding.
+    confined: bool,
+    clip_failures: u64,
+    clip_notice: bool,
 }
 
 impl Injector {
-    pub fn new(handle: Handle, policy: crate::config::FocusPolicy) -> Self {
+    pub fn new(handle: Handle, policy: crate::config::FocusPolicy, clip_cursor: bool) -> Self {
         Self {
             handle,
             policy,
@@ -399,6 +414,10 @@ impl Injector {
             focus_warned: false,
             focus_notice_at: std::time::Instant::now(),
             transient_vks: HashSet::new(),
+            clip_cursor,
+            confined: false,
+            clip_failures: 0,
+            clip_notice: false,
         }
     }
 
@@ -497,7 +516,95 @@ impl Injector {
     }
 
     pub fn end_action(&mut self) {
+        // The other half of the confinement claimed by a mouse move: whatever
+        // this batch took, it gives back as soon as it is done injecting. The
+        // cursor is the user's, and a bot that holds it through the gap between
+        // decisions is a bot that has taken their mouse away.
+        self.release_cursor_clip();
         self.focused = false;
+    }
+
+    /// Whether this injector may take the cursor right now.
+    ///
+    /// The same conditions `may_inject` applies, read without side effects: no
+    /// confinement when the feature is off, when injection is disabled, when the
+    /// user has the controls, or when the game is not the window the input would
+    /// reach - the user's cursor must not be trapped by a batch that is going to
+    /// be refused anyway.
+    fn may_confine(&self) -> bool {
+        self.clip_cursor && self.enabled && !self.suspended && self.focused()
+    }
+
+    /// Confine the cursor to the game window for the rest of this action.
+    ///
+    /// A game frees the cursor when it opens a menu - an inventory, a pause
+    /// screen - and then reads the *real* pointer rather than a raw delta. The
+    /// bot's own mouse steps are relative and unclamped, so the pointer walks
+    /// out of the window within a second and the next click lands on whatever is
+    /// under it. `ClipCursor` is the OS-level answer, and the same one GLFW uses
+    /// for its disabled-cursor mode.
+    ///
+    /// Re-asserted before every move rather than tracked: the game resets the
+    /// clip whenever it takes or gives up the cursor, so "already confined" is
+    /// not something this side can know.
+    fn confine_cursor(&mut self) {
+        let Some(rect) = client_rect_on_screen(self.handle) else {
+            self.note_clip_failure("the window has no client area to confine it to");
+            return;
+        };
+        if let Err(error) = unsafe { ClipCursor(Some(&rect)) } {
+            self.note_clip_failure(&format!("ClipCursor was refused ({error})"));
+            return;
+        }
+        self.confined = true;
+        // A clip only governs where the cursor may *go* next, and a pointer that
+        // is already outside the rectangle - the user moved it while the bot was
+        // paused, or it was never over the game - would sit there until
+        // something moved it. The click about to be injected would land outside
+        // the game, which is the exact failure this exists to stop, so the
+        // pointer is pulled to the middle of the window explicitly.
+        let mut pointer = POINT::default();
+        if unsafe { GetCursorPos(&mut pointer) }.is_ok()
+            && (pointer.x < rect.left
+                || pointer.x >= rect.right
+                || pointer.y < rect.top
+                || pointer.y >= rect.bottom)
+        {
+            let centre_x = (rect.left + rect.right) / 2;
+            let centre_y = (rect.top + rect.bottom) / 2;
+            let _ = unsafe { SetCursorPos(centre_x, centre_y) };
+        }
+        if !self.clip_notice {
+            self.clip_notice = true;
+            println!(
+                "[Input] Cursor confined to the game window while the bot moves it \
+                 (--no-clip-cursor turns this off)."
+            );
+        }
+    }
+
+    /// A confinement failure is a warning, not a stop: the move still reaches the
+    /// game, it is only the pointer that can still leave the window. Said once,
+    /// because it would otherwise repeat twenty times a second.
+    fn note_clip_failure(&mut self, reason: &str) {
+        self.clip_failures += 1;
+        if self.clip_failures == 1 {
+            println!(
+                "[Input] The cursor is NOT confined to the game window ({reason}), so a click \
+                 can still land outside it."
+            );
+        }
+    }
+
+    /// Give the cursor back, if this injector is holding it.
+    pub fn release_cursor_clip(&mut self) {
+        if !self.confined {
+            return;
+        }
+        self.confined = false;
+        if let Err(error) = unsafe { ClipCursor(None) } {
+            self.last_error = Some(format!("ClipCursor(NULL) failed ({error})"));
+        }
     }
 
     /// One line: is input reaching a window, and how much of it.
@@ -512,6 +619,11 @@ impl Injector {
         );
         if self.failures > 0 {
             line += &format!(", {} SendInput failure(s)", self.failures);
+        }
+        if self.clip_failures > 0 {
+            // The count is the only running evidence for a one-time warning: a
+            // cursor that cannot be confined is a click that can land outside.
+            line += &format!(", {} cursor-clip failure(s)", self.clip_failures);
         }
         if let Some(error) = &self.last_error {
             line += &format!(" ({error})");
@@ -634,6 +746,14 @@ impl Injector {
         if vk == 0 {
             return;
         }
+        // A mouse button taps as a click *wherever the cursor happens to be*, so
+        // it confines the cursor first, exactly as a move does. The keyboard
+        // path is where the run sends its clicks (`click:left` and friends are
+        // virtual keys in the action space), which is why this check is here and
+        // not only in `mouse_down`.
+        if crate::keys::is_mouse_vk(vk) && self.may_confine() {
+            self.confine_cursor();
+        }
         self.transient_vks.insert(vk);
         self.send_key(vk, false, false);
         std::thread::sleep(std::time::Duration::from_secs_f32(seconds.max(0.0)));
@@ -642,6 +762,12 @@ impl Injector {
     }
 
     pub fn mouse_move(&mut self, dx: i32, dy: i32) {
+        // Confined *before* the delta is queued: the clamp is applied when the
+        // system processes the move, so a clip taken after `SendInput` returns
+        // can be too late to catch it.
+        if self.may_confine() {
+            self.confine_cursor();
+        }
         self.send_mouse(dx, dy, 0x0001, false); // MOUSEEVENTF_MOVE
     }
 
@@ -653,6 +779,11 @@ impl Injector {
             _ => 0,
         };
         if flag != 0 {
+            // A button goes down where the pointer is, so the pointer has to be
+            // inside the game first.
+            if self.may_confine() {
+                self.confine_cursor();
+            }
             self.send_mouse(0, 0, flag, false);
         }
     }
@@ -697,6 +828,19 @@ impl Injector {
     }
 }
 
+impl Drop for Injector {
+    /// Never leave the user's cursor trapped in a window this process has
+    /// stopped playing.
+    ///
+    /// This is the same promise the key releases make, for the other piece of
+    /// global state the bot touches: keys are undone by the session's own exit
+    /// path, but the cursor clip is desktop-wide, so it is given back on the way
+    /// out even when the run ends by panicking.
+    fn drop(&mut self) {
+        self.release_cursor_clip();
+    }
+}
+
 
 /// Executable name owning `pid`, or an empty string when it cannot be read.
 pub fn get_process_name(pid: u32) -> String {
@@ -733,6 +877,68 @@ pub fn client_size(handle: Handle) -> (i32, i32) {
         return (0, 0);
     }
     (rect.right, rect.bottom)
+}
+
+/// The window's client area, in the screen coordinates a cursor clip is
+/// measured in.
+///
+/// The client area rather than the whole frame: the title bar and the borders
+/// belong to Windows, so confining the cursor to them would only move the
+/// problem - a click on the caption is a click on the window's chrome, not on
+/// the game. `None` when the handle has no real area, which the caller has to
+/// tolerate rather than clip to something empty.
+///
+/// These are the coordinates *this process* sees, which on a scaled display are
+/// a 96-dpi virtual space rather than physical pixels. That is the right space:
+/// `ClipCursor` takes its rectangle in the calling thread's space too, and
+/// converts. Measured, not assumed - a clip set from an unaware thread reads
+/// back through a per-monitor-aware thread scaled by the display's factor (1.25
+/// on the machine this was written on), which is the conversion happening.
+pub fn client_rect_on_screen(handle: Handle) -> Option<RECT> {
+    use windows::Win32::Graphics::Gdi::ClientToScreen;
+    if handle == 0 {
+        return None;
+    }
+    let hwnd = HWND(handle as *mut _);
+    let mut rect = RECT::default();
+    if unsafe { GetClientRect(hwnd, &mut rect) }.is_err() {
+        return None;
+    }
+    if rect.right <= rect.left || rect.bottom <= rect.top {
+        return None;
+    }
+    let mut top_left = POINT {
+        x: rect.left,
+        y: rect.top,
+    };
+    let mut bottom_right = POINT {
+        x: rect.right,
+        y: rect.bottom,
+    };
+    unsafe {
+        // Both corners: the client area need not start at the screen origin and
+        // need not be on the primary monitor.
+        let _ = ClientToScreen(hwnd, &mut top_left);
+        let _ = ClientToScreen(hwnd, &mut bottom_right);
+    }
+    Some(RECT {
+        left: top_left.x,
+        top: top_left.y,
+        right: bottom_right.x,
+        bottom: bottom_right.y,
+    })
+}
+
+/// Let the cursor out of whatever window holds it, claimed by this process or
+/// not.
+///
+/// The injector releases its own clip on the way out, but two exits never unwind
+/// and so never run that: the second Ctrl+C, which exits immediately by design,
+/// and `diagnostics::release_all_keys`, whose whole purpose is to clean up after
+/// a run that died. A clip is desktop-wide state and nothing else in this
+/// process will undo it, so those paths call this instead.
+pub fn free_cursor_clip() {
+    let _ = unsafe { ClipCursor(None) };
 }
 
 pub fn is_minimized(handle: Handle) -> bool {
@@ -1576,7 +1782,7 @@ mod tests {
         use crate::config::FocusPolicy;
         // Handle 1 is not the foreground window, so `focused()` is false and the
         // unforced paths are refused.
-        let mut injector = Injector::new(1, FocusPolicy::Once);
+        let mut injector = Injector::new(1, FocusPolicy::Once, true);
         assert!(!injector.focused());
         injector.begin_action();
         injector.press_vk(0x57);
@@ -1591,7 +1797,7 @@ mod tests {
 
         // With injection disabled, even a forced release is refused - which is
         // what makes it safe to press keys during calibration.
-        let mut disabled = Injector::new(1, FocusPolicy::Once);
+        let mut disabled = Injector::new(1, FocusPolicy::Once, true);
         disabled.enabled = false;
         disabled.release_vk(0x57);
         assert_eq!(disabled.events_sent, 0);
@@ -1599,11 +1805,58 @@ mod tests {
 
         // A suspended injector is silent: the user has the controls, and that is
         // expected rather than a bug worth reporting.
-        let mut suspended = Injector::new(1, FocusPolicy::Once);
+        let mut suspended = Injector::new(1, FocusPolicy::Once, true);
         suspended.suspended = true;
         suspended.release_vk(0x57);
         assert_eq!(suspended.events_sent, 0);
         assert_eq!(suspended.blocked, 0, "a pause is not a bug");
+    }
+
+    /// The clip rectangle Windows is holding, as plain numbers - so a test can
+    /// compare two of them without caring how `RECT` compares.
+    fn cursor_clip() -> Option<(i32, i32, i32, i32)> {
+        use windows::Win32::UI::WindowsAndMessaging::GetClipCursor;
+        let mut rect = RECT::default();
+        unsafe { GetClipCursor(&mut rect) }.ok()?;
+        Some((rect.left, rect.top, rect.right, rect.bottom))
+    }
+
+    /// The second load-bearing safety property: the cursor belongs to the user,
+    /// so an action that is refused must not confine it, and one that never
+    /// claimed it must not release it either.
+    #[test]
+    fn a_refused_action_never_touches_the_cursor_clip() {
+        use crate::config::FocusPolicy;
+        let before = cursor_clip();
+        // Handle 1 is not the foreground window, so nothing is confined.
+        let mut injector = Injector::new(1, FocusPolicy::Once, true);
+        injector.begin_action();
+        injector.mouse_move(40, 40);
+        injector.tap_vk(0x01, 0.0); // a mouse-button tap, the click path
+        injector.mouse_down("left");
+        assert_eq!(injector.mouse_sent, 0, "every move was refused");
+        injector.end_action();
+        // `end_action` runs the release, and it must be a no-op here: an
+        // unconditional `ClipCursor(NULL)` would free a clip the *game* set.
+        assert_eq!(cursor_clip(), before, "the desktop clip must be untouched");
+
+        // And with confinement switched off, the injector never claims it.
+        let mut off = Injector::new(1, FocusPolicy::Once, false);
+        off.begin_action();
+        off.mouse_move(40, 40);
+        off.end_action();
+        assert!(!off.confined);
+        assert_eq!(off.clip_failures, 0, "off is not a failure");
+        assert_eq!(cursor_clip(), before);
+    }
+
+    #[test]
+    fn a_window_that_is_not_a_window_has_no_client_rectangle() {
+        // The clip rectangle is built from `GetClientRect` + `ClientToScreen`,
+        // and a bogus handle must produce nothing rather than an empty rect at
+        // the screen origin - which would pin the cursor to the top-left pixel.
+        assert!(client_rect_on_screen(0).is_none());
+        assert!(client_rect_on_screen(1).is_none());
     }
 
     #[test]
