@@ -18,7 +18,7 @@
 //! these slices one minibatch at a time. The Python does the same thing through
 //! `numpy` -> `torch.as_tensor`.
 
-use rand::Rng;
+use rand::RngExt;
 use rand::seq::SliceRandom;
 
 pub struct RolloutBuffer {
@@ -220,7 +220,7 @@ impl RolloutBuffer {
         &self,
         seq_len: usize,
         minibatch: usize,
-        rng: &mut impl Rng,
+        rng: &mut impl RngExt,
     ) -> Vec<Vec<usize>> {
         let seq_len = seq_len.max(2);
         let n_sequences = self.size / seq_len;

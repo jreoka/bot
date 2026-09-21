@@ -634,7 +634,7 @@ impl<B: Backend> ActorCritic<B> {
     pub fn sample_held(
         &self,
         logits: Tensor<B, 2>,
-        rng: &mut impl rand::Rng,
+        rng: &mut impl rand::RngExt,
     ) -> (Vec<f32>, Tensor<B, 1>) {
         let [rows, n_keys] = logits.dims();
         debug_assert_eq!(rows, 1, "sampling is per control step");
@@ -841,7 +841,7 @@ impl<B: Backend> ActorCritic<B> {
         &self,
         obs: Tensor<B, 4>,
         hidden: Tensor<B, 3>,
-        rng: &mut impl rand::Rng,
+        rng: &mut impl rand::RngExt,
     ) -> StepOutput<B> {
         let tokens = self.encode(obs);
         let (new_hidden, context, features) = self.forward(hidden, tokens.clone());
@@ -1235,13 +1235,13 @@ impl<B: Backend> ActorCritic<B> {
 /// choices in particular carry real weight: the output projections start small
 /// so a fresh block is close to the identity, and the held-key bias starts
 /// negative so pressing keys has to be earned.
-fn standard_normal(rng: &mut impl rand::Rng) -> f32 {
+fn standard_normal(rng: &mut impl rand::RngExt) -> f32 {
     let first: f32 = rng.random::<f32>().max(1e-7);
     let second: f32 = rng.random::<f32>();
     (-2.0 * first.ln()).sqrt() * (2.0 * std::f32::consts::PI * second).cos()
 }
 
-fn normal_values(count: usize, std: f32, rng: &mut impl rand::Rng) -> Vec<f32> {
+fn normal_values(count: usize, std: f32, rng: &mut impl rand::RngExt) -> Vec<f32> {
     (0..count).map(|_| standard_normal(rng) * std).collect()
 }
 
@@ -1256,7 +1256,7 @@ fn normal_values(count: usize, std: f32, rng: &mut impl rand::Rng) -> Vec<f32> {
 /// The gain is applied *after* the whole orthogonalisation, not inside it: the
 /// projection a column is reduced against has to be a unit vector, or the
 /// subtraction removes only `gain` of the component it is meant to remove.
-fn orthogonal_values(rows: usize, cols: usize, gain: f32, rng: &mut impl rand::Rng) -> Vec<f32> {
+fn orthogonal_values(rows: usize, cols: usize, gain: f32, rng: &mut impl rand::RngExt) -> Vec<f32> {
     // `torch` orthogonalises the smaller dimension, working on the transpose
     // when the matrix is short and wide.
     let (tall, wide, transposed) = if rows < cols {
@@ -1300,14 +1300,14 @@ fn orthogonal_values(rows: usize, cols: usize, gain: f32, rng: &mut impl rand::R
 }
 
 /// `torch.nn.init.kaiming_normal_` with `nonlinearity="relu"`: `N(0, sqrt(2/fan_in))`.
-fn kaiming_values(count: usize, fan_in: usize, rng: &mut impl rand::Rng) -> Vec<f32> {
+fn kaiming_values(count: usize, fan_in: usize, rng: &mut impl rand::RngExt) -> Vec<f32> {
     let std = (2.0 / fan_in.max(1) as f32).sqrt();
     normal_values(count, std, rng)
 }
 
 impl<B: Backend> ActorCritic<B> {
     /// Initialise every weight the way the Python's constructor does.
-    pub fn init(&mut self, rng: &mut impl rand::Rng, device: &B::Device) {
+    pub fn init(&mut self, rng: &mut impl rand::RngExt, device: &B::Device) {
         let d = self.dims.clone();
         let embed = d.embed_dim;
         let inner = d.heads * d.head_dim;
@@ -1434,7 +1434,7 @@ fn head_parameters<B: Backend>(
     embed: usize,
     gain: f32,
     bias_fill: f32,
-    rng: &mut impl rand::Rng,
+    rng: &mut impl rand::RngExt,
     device: &B::Device,
 ) -> (Param<Tensor<B, 2>>, Param<Tensor<B, 1>>) {
     let weight = orthogonal_values(out, embed, gain, rng);
@@ -1553,7 +1553,7 @@ fn logits_to_host<B: Backend>(logits: &Tensor<B, 2>) -> Vec<f32> {
 }
 
 /// Sample one index from `scores`, treating them as unnormalised logits.
-fn sample_categorical(scores: &[f32], rng: &mut impl rand::Rng) -> usize {
+fn sample_categorical(scores: &[f32], rng: &mut impl rand::RngExt) -> usize {
     let probabilities = softmax_host(scores);
     let draw: f32 = rng.random();
     let mut cumulative = 0.0f32;

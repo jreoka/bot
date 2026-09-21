@@ -422,7 +422,7 @@ pub fn random_baseline(
     max_steps: usize,
     seed: u64,
 ) -> Distances {
-    use rand::Rng;
+    use rand::RngExt;
     let mut rng = <rand::rngs::StdRng as rand::SeedableRng>::seed_from_u64(seed);
     let mut distances = Vec::new();
     for _episode in 0..episodes {

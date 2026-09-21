@@ -6,6 +6,9 @@ rust-version = "1.92"
 description = "A game-agnostic bot that learns to play from pixels - Rust port of bot1.py"
 
 [dependencies]
+# `flex` is Burn's current pure-Rust CPU backend. It is not deprecated - it is
+# the replacement for `burn-ndarray`, which Burn 0.21 put on the deprecation
+# path. `burn` 0.21.0 is the latest stable release.
 burn = { version = "0.21", features = ["flex", "autodiff", "store"] }
 serde = { version = "1", features = ["derive"] }
 # `preserve_order` keeps a keymap's key order as written: the order of `keys` in
@@ -14,8 +17,7 @@ serde = { version = "1", features = ["derive"] }
 # the way the Python's does.
 serde_json = { version = "1", features = ["preserve_order"] }
 anyhow = "1"
-rand = "0.9"
-ndarray = "0.16"
+rand = "0.10"
 
 # The Win32 layer. Gated by target so the model, the reward, the trainer and the
 # self-test keep building anywhere - the same split the Python has, where only
@@ -39,12 +41,12 @@ windows = { version = "0.62", features = [
 # The X11 layer. `x11rb` is a pure-Rust X11 client - no libX11, no C at all - so
 # the single-binary property survives on Linux exactly as it does on Windows.
 [target.'cfg(target_os = "linux")'.dependencies]
-x11rb = { version = "0.13", features = ["xtest", "xinput", "record", "randr"] }
+x11rb = { version = "0.14", features = ["xtest", "xinput", "record", "randr"] }
 
 # The CoreGraphics layer. These are Rust bindings to the system frameworks, so
 # the binary still needs nothing installed: the frameworks are part of macOS.
 [target.'cfg(target_os = "macos")'.dependencies]
-core-graphics = "0.24"
+core-graphics = "0.25"
 core-foundation = "0.10"
 
 [features]

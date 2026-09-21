@@ -1269,7 +1269,7 @@ fn scalar<B: Backend>(tensor: &Tensor<B, 1>) -> f32 {
 fn sample_held<B: Backend>(
     model: &ActorCritic<B>,
     logits: Tensor<B, 2>,
-    rng: &mut impl rand::Rng,
+    rng: &mut impl rand::RngExt,
 ) -> Vec<f32> {
     let scores = values(model.held_logits_of_masks(logits));
     let index = sample_from_scores(&scores, rng);
@@ -1277,7 +1277,7 @@ fn sample_held<B: Backend>(
 }
 
 /// Sample one index from unnormalised scores.
-fn sample_from_scores(scores: &[f32], rng: &mut impl rand::Rng) -> usize {
+fn sample_from_scores(scores: &[f32], rng: &mut impl rand::RngExt) -> usize {
     let max = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
     let exps: Vec<f32> = scores.iter().map(|score| (score - max).exp()).collect();
     let total: f32 = exps.iter().sum();
@@ -1293,7 +1293,7 @@ fn sample_from_scores(scores: &[f32], rng: &mut impl rand::Rng) -> usize {
 }
 
 /// Draw one categorical index from a `(1, classes)` logit row.
-fn sample_categorical<B: Backend>(logits: &Tensor<B, 2>, rng: &mut impl rand::Rng) -> usize {
+fn sample_categorical<B: Backend>(logits: &Tensor<B, 2>, rng: &mut impl rand::RngExt) -> usize {
     sample_from_scores(&values(logits.clone()), rng)
 }
 
