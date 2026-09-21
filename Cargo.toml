@@ -1,0 +1,63 @@
+[package]
+name = "bot1"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.92"
+description = "A game-agnostic bot that learns to play from pixels - Rust port of bot1.py"
+
+[dependencies]
+burn = { version = "0.21", features = ["flex", "autodiff", "store"] }
+serde = { version = "1", features = ["derive"] }
+# `preserve_order` keeps a keymap's key order as written: the order of `keys` in
+# `keymap.json` is the order the Python's dict preserves, and while the action
+# space sorts by priority either way, a file this port writes should read back
+# the way the Python's does.
+serde_json = { version = "1", features = ["preserve_order"] }
+anyhow = "1"
+rand = "0.9"
+ndarray = "0.16"
+
+# The Win32 layer. Gated by target so the model, the reward, the trainer and the
+# self-test keep building anywhere - the same split the Python has, where only
+# the window and input modes need Windows.
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.62", features = [
+    "Win32_Foundation",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_Graphics_Gdi",
+    "Win32_System_Threading",
+    "Win32_System_Console",
+    "Win32_System_Diagnostics_ToolHelp",
+    "Win32_System_LibraryLoader",
+    # `PrintWindow` is declared alongside the printing APIs in the Windows
+    # metadata, so capturing a window needs this feature even though nothing
+    # here prints anything.
+    "Win32_Storage_Xps",
+] }
+
+# The X11 layer. `x11rb` is a pure-Rust X11 client - no libX11, no C at all - so
+# the single-binary property survives on Linux exactly as it does on Windows.
+[target.'cfg(target_os = "linux")'.dependencies]
+x11rb = { version = "0.13", features = ["xtest", "xinput", "record", "randr"] }
+
+# The CoreGraphics layer. These are Rust bindings to the system frameworks, so
+# the binary still needs nothing installed: the frameworks are part of macOS.
+[target.'cfg(target_os = "macos")'.dependencies]
+core-graphics = "0.24"
+core-foundation = "0.10"
+
+[features]
+default = []
+# Optional GPU path. The default build is pure Rust and needs no driver beyond
+# the OS itself; `--features wgpu` swaps in Burn's WebGPU backend.
+wgpu = ["burn/wgpu"]
+
+# Burn's CPU kernels are unusably slow in a debug build, and this crate is
+# almost entirely kernel-bound, so the dev profile keeps optimisations on.
+[profile.dev]
+opt-level = 2
+
+[profile.release]
+lto = "thin"
+codegen-units = 1

@@ -1,0 +1,24 @@
+# Release configuration for the single-binary goal.
+#
+# Rust's MSVC target links the C runtime dynamically by default, which makes the
+# executable depend on `VCRUNTIME140.dll` - the Visual C++ redistributable. It is
+# present on most machines and absent on some, which is exactly the kind of
+# dependency a "single self-contained binary" is supposed to not have.
+#
+# With `+crt-static` the runtime is linked in, and what is left in the loader's
+# module list is only what Windows itself provides:
+#
+#   before: apphelp, bcryptprimitives, gdi32, IMM32, KERNEL32, KERNELBASE,
+#           msvcp_win, ntdll, ucrtbase, USER32, VCRUNTIME140, win32u
+#   after:  the same list without VCRUNTIME140
+#
+# Scoped to the Windows target so it cannot affect the Linux or macOS builds.
+# For a Linux binary with no dynamic dependencies at all, build for musl:
+#
+#   rustup target add x86_64-unknown-linux-musl
+#   cargo build --release --target x86_64-unknown-linux-musl
+#
+# macOS links against the system frameworks, which are part of the OS, so it needs
+# nothing here.
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]

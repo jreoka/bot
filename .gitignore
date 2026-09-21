@@ -1,14 +1,7 @@
-*
-!LICENSE
-!README.md
-!bot1.py
-!botcore/
-!botcore/**
-# Compiled bytecode is a build artefact, not source: it is machine- and
-# interpreter-specific and only ever adds noise to a diff.
-botcore/__pycache__/
-**/__pycache__/
-*.pyc
-!keymap.json
-!requirements.txt
-!.gitignore
+# Rust build output and run artifacts.
+/target/
+/checkpoints/
+
+# The parity fixtures in parity/out/ are committed on purpose: they are the
+# oracle the port is verified against, and a test that regenerates its own
+# oracle can drift with it. See NOTES.md.
