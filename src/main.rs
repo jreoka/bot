@@ -6,6 +6,9 @@
 //! next, so today this binary runs the self-test and says what it is waiting for
 //! otherwise.
 
+use std::cell::RefCell;
+use std::sync::mpsc::{Receiver, TryRecvError};
+
 use burn::backend::{Autodiff, Flex};
 
 type Backend = Autodiff<Flex>;
@@ -272,7 +275,7 @@ fn train(arguments: &[String]) -> anyhow::Result<()> {
     // Checkpointing: one manager owns the directory, and the save closure is
     // what the run calls when the timer or the F9 key says it is due.
     let fresh = has("--fresh");
-    let mut manager = bot1::checkpoint::CheckpointManager::new(&cfg.checkpoint_dir, cfg.checkpoint_keep);
+    let manager = bot1::checkpoint::CheckpointManager::new(&cfg.checkpoint_dir, cfg.checkpoint_keep);
     if let (true, Some(path)) = (cfg.resume && !fresh, manager.newest()) {
         match session.load_checkpoint(&path) {
             Ok(meta) => println!(
@@ -301,37 +304,179 @@ fn train(arguments: &[String]) -> anyhow::Result<()> {
     let steps = value_of("--steps", 0);
     let max_decisions = if steps == 0 { None } else { Some(steps) };
     {
+        // Checkpoints are serialised on their own thread and only renamed here.
+        //
+        // Writing one means copying every weight out of the model and writing
+        // them to disk - twice, once for the numbered file and once for the
+        // rolling last.safetensors. That is hundreds of milliseconds to seconds
+        // taken out of the control loop, which is a pause in the game for no
+        // reason at all: the weights do not change while the bytes are being
+        // written. So the bytes go to a thread, and this loop does only the
+        // renames, which are file-system metadata.
+        //
+        // One write is in flight at a time: a slow disk costs one checkpoint
+        // rather than a queue of them, which is the rule the interval itself
+        // follows too.
+        let saver = RefCell::new((manager, None::<Receiver<StagedCheckpoint>>, 0u64));
+
         let mut save = |session: &bot1::session::GameSession<Backend>, reason: &str| {
+            let mut saver = saver.borrow_mut();
+            let (manager, in_flight, last_step) = &mut *saver;
+
+            // Collect a finished write before deciding whether another may start.
+            if let Some(channel) = in_flight {
+                match channel.try_recv() {
+                    Ok((plan, Ok(()))) => {
+                        let path = manager.finish_write(plan);
+                        println!(
+                            "[Checkpoint] step {} ({reason}): {}",
+                            session.total_steps,
+                            path.file_name().unwrap_or_default().to_string_lossy()
+                        );
+                        *in_flight = None;
+                    }
+                    Ok((_, Err(error))) => {
+                        println!("[Checkpoint] FAILED to save: {error}");
+                        *in_flight = None;
+                    }
+                    // Still writing: nothing to collect yet.
+                    Err(TryRecvError::Empty) => {}
+                    // The writing thread died without sending. Its temporary
+                    // files are not trustworthy, but the run must not stop
+                    // taking checkpoints because of it: forget the write and let
+                    // the next interval try again.
+                    Err(TryRecvError::Disconnected) => {
+                        println!(
+                            "[Checkpoint] The writing thread stopped without finishing; that \
+                             checkpoint is lost and the next interval will try again."
+                        );
+                        *in_flight = None;
+                    }
+                }
+            }
+
             let meta = session.meta();
-            match manager.save(&session.policy.to_weights(), &meta, reason) {
-                Ok(path) => println!(
-                    "[Checkpoint] step {} ({}): {}",
-                    meta.step,
-                    reason,
-                    path.file_name().unwrap_or_default().to_string_lossy()
-                ),
-                Err(error) => println!("[Checkpoint] FAILED to save: {error}"),
+            if meta.step == *last_step {
+                // Nothing has been learned since the last request. Claiming a
+                // sequence number for an identical checkpoint would push the
+                // older, more interesting ones out of the kept set.
+                return;
+            }
+            if in_flight.is_some() {
+                // The previous write has not landed. Skipping this request rather
+                // than queueing it is deliberate: a checkpoint is the newest
+                // state, and the request comes round again in one interval.
+                println!(
+                    "[Checkpoint] step {}: the previous write is still running; skipping \
+                     this one.",
+                    meta.step
+                );
+                return;
+            }
+
+            let started = std::time::Instant::now();
+            // In an `Arc` so the writing thread can have it without a second copy:
+            // these are every weight in the model.
+            let tensors = std::sync::Arc::new(session.policy.to_weights());
+            let plan = manager.plan_write(&meta, reason);
+            let (finished_tx, finished_rx) = std::sync::mpsc::channel::<StagedCheckpoint>();
+            let spawned = std::thread::Builder::new()
+                .name("bot1-checkpoint".to_string())
+                .spawn({
+                    let plan = plan.clone();
+                    let meta = meta.clone();
+                    let tensors = tensors.clone();
+                    move || {
+                        let outcome = bot1::checkpoint::CheckpointManager::stage_write(
+                            &plan, &tensors, &meta,
+                        );
+                        let _ = finished_tx.send((plan, outcome));
+                    }
+                });
+            match spawned {
+                Ok(_) => *in_flight = Some(finished_rx),
+                Err(error) => {
+                    // No thread: stage it here rather than lose the checkpoint.
+                    println!(
+                        "[Checkpoint] Could not start the writing thread ({error}); saving \
+                         inline."
+                    );
+                    match bot1::checkpoint::CheckpointManager::stage_write(&plan, &tensors, &meta)
+                    {
+                        Ok(()) => {
+                            let path = manager.finish_write(plan);
+                            println!(
+                                "[Checkpoint] step {} ({reason}): {}",
+                                meta.step,
+                                path.file_name().unwrap_or_default().to_string_lossy()
+                            );
+                        }
+                        Err(error) => println!("[Checkpoint] FAILED to save: {error}"),
+                    }
+                }
+            }
+            *last_step = meta.step;
+            let elapsed = started.elapsed().as_secs_f64();
+            if elapsed > 0.05 {
+                println!(
+                    "[Checkpoint] Preparing a checkpoint cost {:.0}ms of the control loop; \
+                     that is the weight copy, and it is the part that cannot leave this \
+                     thread.",
+                    elapsed * 1000.0
+                );
             }
         };
+
         session.run(Some(&mut control), max_decisions, Some(&mut save));
+
+        // Whatever is still being written lands before the final line is printed,
+        // so the list below is the list on disk.
+        let (manager, in_flight, _) = saver.into_inner();
+        let mut manager = manager;
+        if let Some(channel) = in_flight {
+            match channel.recv() {
+                Ok((plan, Ok(()))) => {
+                    let step = plan.step;
+                    let path = manager.finish_write(plan);
+                    println!(
+                        "[Checkpoint] step {step} (on the way out): {}",
+                        path.file_name().unwrap_or_default().to_string_lossy()
+                    );
+                }
+                Ok((_, Err(error))) => println!("[Checkpoint] FAILED to save: {error}"),
+                Err(_) => {}
+            }
+        }
+
         // A run that stopped for any reason still writes what it learned: a run
         // that ends without a checkpoint is a run that lost everything since the
         // last one.
         if session.total_steps > 0 {
-            save(&session, "final");
+            let final_path = manager.directory.join("final.safetensors");
+            match session.save_checkpoint(&final_path) {
+                Ok(()) => println!(
+                    "[Checkpoint] step {} (final): final.safetensors",
+                    session.total_steps
+                ),
+                Err(error) => println!("[Checkpoint] FAILED to save the final model: {error}"),
+            }
         }
+        control.stop();
+        session.close();
+        println!("[Run] Stopped ({}).", control.stop_reason());
+        for entry in manager.list_kept() {
+            println!(
+                "       step {:>9}  ({})  {}",
+                entry.step, entry.reason, entry.path
+            );
+        }
+        return Ok(());
     }
-    control.stop();
-    session.close();
-    println!("[Run] Stopped ({}).", control.stop_reason());
-    for entry in manager.list_kept() {
-        println!(
-            "       step {:>9}  ({})  {}",
-            entry.step, entry.reason, entry.path
-        );
-    }
-    Ok(())
 }
+
+/// A checkpoint's staged bytes on their way back from the writing thread, with
+/// the outcome of writing them.
+type StagedCheckpoint = (bot1::checkpoint::CheckpointPlan, anyhow::Result<()>);
 
 /// `--benchmark [--window HANDLE] [--decisions N]`: what a step costs here.
 fn benchmark(configured: u64, decisions: u64) -> anyhow::Result<()> {

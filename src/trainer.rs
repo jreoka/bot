@@ -409,8 +409,16 @@ impl<B: AutodiffBackend> Trainer<B> {
     /// Parameters that have gone non-finite, which make every later checkpoint
     /// worthless.
     pub fn nonfinite_parameters(policy: &ActorCritic<B>) -> Vec<String> {
+        Self::nonfinite_parameters_from_net(&policy.net)
+    }
+
+    /// The same check against a bare parameter tree.
+    ///
+    /// The learning thread hands back weights rather than a policy, because the
+    /// optimiser's state belongs to that thread; this is what lets the session
+    /// vet them before they become the ones it plays with.
+    pub fn nonfinite_parameters_from_net(net: &Net<B>) -> Vec<String> {
         let mut bad: Vec<String> = Vec::new();
-        let net = &policy.net;
         let check = |name: &str, tensor: Tensor<B, 2>, bad: &mut Vec<String>| {
             let values = tensor.into_data().to_vec::<f32>().unwrap_or_default();
             if values.iter().any(|value| !value.is_finite()) {

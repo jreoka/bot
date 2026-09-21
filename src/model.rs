@@ -378,6 +378,12 @@ pub struct SequenceOutput<B: Backend> {
 }
 
 /// The whole bot.
+///
+/// `Clone` is cheap: the parameters live behind `Arc` handles, so a clone is one
+/// copy of the parameter tree's handles rather than one copy of the weights. That
+/// is what lets the learning worker own a policy of its own while the collection
+/// loop keeps using this one - see `session::LearnWorker`.
+#[derive(Clone)]
 pub struct ActorCritic<B: Backend> {
     pub net: Net<B>,
     pub dims: Dims,

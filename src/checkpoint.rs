@@ -120,6 +120,25 @@ pub struct Entry {
     pub reason: String,
 }
 
+/// A checkpoint whose bytes have not been written yet: where they go, and what
+/// has to be recorded once they are there.
+///
+/// The names are decided on the control loop (they need the sequence counter),
+/// the bytes are written on another thread, and the renames happen back on the
+/// control loop. Between the two, nothing outside points at the temporary files.
+#[derive(Debug, Clone)]
+pub struct CheckpointPlan {
+    pub seq: u64,
+    pub step: u64,
+    pub reason: String,
+    /// The final path, not yet existing.
+    pub path: PathBuf,
+    /// Where the numbered checkpoint's bytes go first.
+    pub temporary: PathBuf,
+    /// Where the rolling `last.safetensors` copy's bytes go first.
+    pub last_temporary: PathBuf,
+}
+
 /// Owns a checkpoint directory: what is in it, what to write next, and what to
 /// delete.
 pub struct CheckpointManager {
@@ -158,46 +177,82 @@ impl CheckpointManager {
         meta: &SessionMeta,
         reason: &str,
     ) -> anyhow::Result<PathBuf> {
+        let plan = self.plan_write(meta, reason);
+        Self::stage_write(&plan, tensors, meta)?;
+        Ok(self.finish_write(plan))
+    }
+
+    /// Name the next checkpoint: the sequence number, the path, and the two
+    /// temporary files the bytes go into.
+    ///
+    /// Cheap and cheap on purpose - a counter and a timestamp - so it is safe to
+    /// call from the control loop. [`CheckpointManager::stage_write`] is the part
+    /// that belongs on a thread of its own.
+    pub fn plan_write(&mut self, meta: &SessionMeta, reason: &str) -> CheckpointPlan {
         self.seq += 1;
-        let seq = self.seq;
         let stamp = timestamp();
-        let name = format!(
-            "checkpoint_{seq:09}_step{:09}_{stamp}.safetensors",
-            meta.step
-        );
-        let path = self.directory.join(&name);
+        let path = self.directory.join(format!(
+            "checkpoint_{:09}_step{:09}_{stamp}.safetensors",
+            self.seq, meta.step
+        ));
+        CheckpointPlan {
+            seq: self.seq,
+            step: meta.step,
+            reason: reason.to_string(),
+            temporary: path.with_extension("safetensors.tmp"),
+            last_temporary: self.directory.join("last.safetensors.tmp"),
+            path,
+        }
+    }
+
+    /// Write the checkpoint's bytes to the plan's temporary files.
+    ///
+    /// This is the expensive half - every weight serialised, twice - and it
+    /// touches nothing on the manager: the same plan can be staged on another
+    /// thread while the session carries on playing. Nothing is visible to
+    /// `--resume` until [`CheckpointManager::finish_write`] renames it, so an
+    /// interrupted stage cannot destroy a good checkpoint.
+    pub fn stage_write(
+        plan: &CheckpointPlan,
+        tensors: &[(String, Vec<usize>, Vec<f32>)],
+        meta: &SessionMeta,
+    ) -> anyhow::Result<()> {
         let metadata = meta.to_metadata()?;
-
-        // Temporary then rename: an interrupted save must not destroy a good
-        // checkpoint, and must not leave a half-written file that looks whole.
-        let temporary = path.with_extension("safetensors.tmp");
-        crate::weights::write_safetensors_with_metadata(&temporary, tensors, &metadata)?;
-        std::fs::rename(&temporary, &path)?;
-
+        crate::weights::write_safetensors_with_metadata(&plan.temporary, tensors, &metadata)?;
         // The rolling copy, for `--resume` to find quickly. A failure here is
-        // reported and never fatal: the numbered checkpoint is already saved.
-        let last_temporary = self.directory.join("last.safetensors.tmp");
+        // reported and never fatal: the numbered checkpoint is still staged.
         match crate::weights::write_safetensors_with_metadata(
-            &last_temporary,
+            &plan.last_temporary,
             tensors,
             &metadata,
         ) {
-            Ok(()) => {
-                let _ = std::fs::rename(&last_temporary, self.last_path());
+            Ok(()) => {}
+            Err(error) => {
+                println!("[Checkpoint] Rolling last.safetensors copy failed: {error}");
+                let _ = std::fs::remove_file(&plan.last_temporary);
             }
-            Err(error) => println!("[Checkpoint] Rolling last.safetensors copy failed: {error}"),
+        }
+        Ok(())
+    }
+
+    /// The cheap half: make the staged files the real ones, and record what was
+    /// written.
+    pub fn finish_write(&mut self, plan: CheckpointPlan) -> PathBuf {
+        let _ = std::fs::rename(&plan.temporary, &plan.path);
+        if plan.last_temporary.exists() {
+            let _ = std::fs::rename(&plan.last_temporary, self.last_path());
         }
 
         self.entries.push(Entry {
-            path: path.to_string_lossy().to_string(),
-            seq,
-            step: meta.step,
+            path: plan.path.to_string_lossy().to_string(),
+            seq: plan.seq,
+            step: plan.step,
             mtime: now_seconds(),
-            reason: reason.to_string(),
+            reason: plan.reason,
         });
         self.prune();
         self.save_index();
-        Ok(path)
+        plan.path
     }
 
     /// Keep the newest `keep`, delete the rest.
@@ -454,5 +509,58 @@ mod tests {
             )
             .unwrap_err();
         assert!(error.to_string().contains("observation"), "{error}");
+    }
+
+    /// The split the async path relies on: the bytes are staged on their own
+    /// thread, and the control loop only does the renames.
+    #[test]
+    fn a_checkpoint_can_be_written_in_two_halves() {
+        let dir = temp_dir("split");
+        let mut manager = CheckpointManager::new(&dir, 3);
+        let tensors = vec![("w".to_string(), vec![2], vec![1.0, 2.0])];
+
+        // Half one: name it, then stage the bytes - as another thread would.
+        let plan = manager.plan_write(&meta(512), "periodic");
+        assert!(!plan.path.exists(), "the numbered file is not there yet");
+        CheckpointManager::stage_write(&plan, &tensors, &meta(512)).unwrap();
+        assert!(plan.temporary.exists());
+        assert!(plan.last_temporary.exists());
+        assert!(
+            manager.list_kept().is_empty(),
+            "nothing is kept until it is finished"
+        );
+        // And what was staged is already a complete, loadable checkpoint.
+        let staged = crate::weights::Weights::open(&plan.temporary).unwrap();
+        assert_eq!(staged.f32("w").unwrap(), vec![1.0, 2.0]);
+        assert_eq!(
+            SessionMeta::from_metadata(&staged.metadata()).unwrap().step,
+            512
+        );
+
+        // Half two: renames and the index, nothing else.
+        let finished = manager.finish_write(plan);
+        assert!(finished.exists());
+        assert_eq!(manager.list_kept().len(), 1);
+        assert!(manager.last_path().exists());
+        assert_eq!(
+            SessionMeta::from_metadata(
+                &crate::weights::Weights::open(&finished).unwrap().metadata()
+            )
+            .unwrap()
+            .step,
+            512
+        );
+    }
+
+    /// The sequence number is allocated at planning time, so a checkpoint staged
+    /// but never finished cannot make the next one reuse its name.
+    #[test]
+    fn a_staged_checkpoint_does_not_hand_its_number_to_the_next_one() {
+        let dir = temp_dir("stage-seq");
+        let mut manager = CheckpointManager::new(&dir, 3);
+        let abandoned = manager.plan_write(&meta(1), "periodic");
+        let next = manager.plan_write(&meta(2), "periodic");
+        assert_ne!(abandoned.seq, next.seq);
+        assert_ne!(abandoned.path, next.path);
     }
 }

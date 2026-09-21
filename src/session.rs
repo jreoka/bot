@@ -11,8 +11,19 @@
 //! `step`, `release_all` and observations are all an environment has to provide,
 //! so the same session runs against a real window or the synthetic game - the
 //! same arrangement as the Python, with the shape written down.
+//!
+//! One deliberate departure from the Python: **the update does not run on the
+//! thread that plays the game.** It used to, and it meant the bot stood still
+//! for as long as PPO took - seconds, every rollout, with no frame captured and
+//! nothing pressed. `LearnWorker` moves it to a thread of its own, and the
+//! control loop only ever swaps weights in at a rollout boundary. Everything the
+//! update needs (the rollout, the weights it was collected with, the bootstrap
+//! value) moves with the job, so the arithmetic is the same; what changes is
+//! that the game keeps being played while it happens.
 
 use std::collections::{HashMap, VecDeque};
+use std::sync::mpsc;
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use burn::module::AutodiffModule;
@@ -22,7 +33,7 @@ use burn::tensor::TensorData;
 
 use crate::config::Config;
 use crate::keys::{ActionSpace, Keymap};
-use crate::model::{Action, ActorCritic};
+use crate::model::{Action, ActorCritic, Net};
 use crate::novelty::{IntrinsicReward, Signature};
 use crate::replay::RolloutBuffer;
 use crate::trainer::Trainer;
@@ -229,6 +240,225 @@ fn push_capped(series: &mut VecDeque<f32>, value: f32, cap: usize) {
     series.push_back(value);
 }
 
+// =============================================================================
+// The learning worker
+// =============================================================================
+//
+// The update used to run on the thread that injects input, and that is the one
+// thing this program must not do: while `Trainer::update` is running, no frame
+// is captured and no key is pressed, so the bot stops playing for as long as the
+// update takes - seconds, every rollout. On a CPU backend that is long enough for
+// the game to move on without it.
+//
+// So the update runs here instead, on a thread of its own, against its own copy
+// of the policy. The session keeps collecting with the copy it has; when the
+// worker finishes, its weights are swapped in at the next rollout boundary. The
+// control loop therefore never waits for training, and the pause is gone rather
+// than merely shortened.
+//
+// What this costs is bounded staleness: while an update runs, the frames being
+// collected come from the policy *before* that update, exactly as they did when
+// the update ran inline - the difference is that the bot keeps playing instead of
+// standing still. The update itself still starts from the same weights the
+// rollout was collected with, so PPO's ratio is computed against the behavior
+// policy and nothing is silently off-policy.
+
+/// One rollout, handed to the learning thread.
+struct LearnJob<B: AutodiffBackend> {
+    /// The weights this rollout was collected with: what the update starts from.
+    weights: Net<B>,
+    buffer: RolloutBuffer,
+    /// Value of the observation after the last step, for the GAE tail.
+    last_value: f32,
+}
+
+/// What the learning thread hands back.
+struct LearnResult<B: AutodiffBackend> {
+    weights: Net<B>,
+    seconds: f64,
+    updates: u64,
+    metrics: HashMap<String, f32>,
+}
+
+enum WorkerRequest<B: AutodiffBackend> {
+    Update(LearnJob<B>),
+}
+
+/// Owns the learning thread and the last finished update.
+struct LearnWorker<B: AutodiffBackend> {
+    requests: mpsc::Sender<WorkerRequest<B>>,
+    /// One edge per finished update; the update itself travels through `running`.
+    results: mpsc::Receiver<()>,
+    running: Arc<Mutex<Option<LearnResult<B>>>>,
+    /// Updates submitted and not yet finished. Shared with the learning thread
+    /// rather than inferred from timestamps, so the control loop can tell
+    /// "training" from "idle" without guessing.
+    pending: Arc<std::sync::atomic::AtomicUsize>,
+    /// A worker whose channel has closed: it failed to start, or its thread
+    /// died. Training is disabled rather than being allowed to take the run down,
+    /// and the status block says so.
+    dead: bool,
+}
+
+/// Marks one accepted job as outstanding, however the job's thread ends.
+struct PendingGuard(Arc<std::sync::atomic::AtomicUsize>);
+
+impl Drop for PendingGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+    }
+}
+
+impl<B: AutodiffBackend> LearnWorker<B> {
+    /// Spawn the thread. `policy` is the weights to train from and `trainer` is
+    /// moved outright: the optimiser's state belongs to the training thread, and
+    /// with one worker there is nothing to share it with.
+    fn spawn(mut trainer: Trainer<B>, mut policy: ActorCritic<B>) -> Option<Self> {
+        let (request_tx, request_rx) = mpsc::channel::<WorkerRequest<B>>();
+        // Sends nothing: the result itself travels through the slot, and the
+        // channel is only the "a result is ready" edge. One lock of that slot per
+        // update is cheaper than moving a whole parameter tree through a channel.
+        let (result_tx, result_rx) = mpsc::channel::<()>();
+        let running: Arc<Mutex<Option<LearnResult<B>>>> = Arc::new(Mutex::new(None));
+        let slot = running.clone();
+        let pending = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let outstanding = pending.clone();
+
+        std::thread::Builder::new()
+            .name("bot1-learn".to_string())
+            .spawn(move || {
+                // Recv, not loop-until-stop: the sender is owned by the session,
+                // so the thread ends when the run does and cannot outlive it.
+                while let Ok(WorkerRequest::Update(job)) = request_rx.recv() {
+                    // One outstanding job at a time, so this cannot subtract
+                    // another job's count: the session only submits when this is
+                    // zero. The guard covers every exit from the iteration,
+                    // including the `break` below.
+                    let _job_done = PendingGuard(outstanding.clone());
+                    // The policy starts from the weights the rollout was
+                    // collected with, which are on the job - never from whatever
+                    // this thread happens to hold.
+                    policy.net = job.weights;
+                    let started = Instant::now();
+                    let mut metrics = trainer.update(&mut policy, &job.buffer, job.last_value);
+                    // Whatever is left of the update budget is shared with the
+                    // curiosity head, as before - except that this no longer
+                    // steals frames, so a slow machine collects throughout.
+                    let spent = started.elapsed().as_secs_f64();
+                    let remaining =
+                        (trainer.cfg.update_seconds_budget as f64 * 0.5 - spent).max(0.0);
+                    if job.buffer.action_vectors().is_some() && remaining > 0.0 {
+                        metrics.extend(trainer.train_transition(
+                            &mut policy,
+                            &job.buffer,
+                            trainer.cfg.minibatch_size,
+                            2,
+                            remaining,
+                        ));
+                    }
+                    let result = LearnResult {
+                        weights: policy.net.clone(),
+                        seconds: started.elapsed().as_secs_f64(),
+                        updates: trainer.updates,
+                        metrics,
+                    };
+                    // The channel read is the guard: it is sent only after the
+                    // slot holds the result.
+                    let stored = match slot.lock() {
+                        Ok(mut held) => {
+                            *held = Some(result);
+                            true
+                        }
+                        Err(_) => false,
+                    };
+                    if !stored || result_tx.send(()).is_err() {
+                        break;
+                    }
+                }
+            })
+            .ok()?;
+
+        Some(Self {
+            requests: request_tx,
+            results: result_rx,
+            running,
+            pending,
+            dead: false,
+        })
+    }
+
+    /// Hand an update over. Never blocks: the worker keeps its own copy of the
+    /// weights the job carries.
+    fn submit(&mut self, job: LearnJob<B>) {
+        if self.dead {
+            return;
+        }
+        self.pending
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        if self.requests.send(WorkerRequest::Update(job)).is_err() {
+            self.pending
+                .fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+            self.dead = true;
+        }
+    }
+
+    /// Updates the worker has accepted and not yet finished.
+    fn in_flight(&self) -> usize {
+        self.pending.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// The newest finished update, or `None`.
+    ///
+    /// A backlog is drained and only its last result kept: applying an update
+    /// that a newer one has already superseded would step the optimiser through
+    /// weights the main thread never saw.
+    fn poll(&mut self) -> Option<LearnResult<B>> {
+        let mut latest: Option<LearnResult<B>> = None;
+        while let Ok(()) = self.results.try_recv() {
+            match self.running.lock() {
+                Ok(mut held) => {
+                    if let Some(result) = held.take() {
+                        latest = Some(result);
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+        latest
+    }
+
+    /// Wait up to `timeout`, collecting everything the worker produces.
+    ///
+    /// Used once, when the run is stopping: one bounded wait is what keeps the
+    /// last rollout from being thrown away without making a user who asked the
+    /// bot to stop watch it train for another six seconds.
+    fn wait_for_update(&mut self, timeout: std::time::Duration) -> Option<LearnResult<B>> {
+        let mut latest: Option<LearnResult<B>> = None;
+        let deadline = Instant::now() + timeout;
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if self.results.recv_timeout(remaining).is_err() {
+                break;
+            }
+            match self.running.lock() {
+                Ok(mut held) => {
+                    if let Some(result) = held.take() {
+                        latest = Some(result);
+                    }
+                }
+                Err(_) => break,
+            }
+            if Instant::now() >= deadline {
+                break;
+            }
+        }
+        // A timeout does not mean the worker produced nothing: it may have
+        // finished as the wait expired, and that result must not be left in the
+        // slot to be picked up by a later call.
+        latest.or_else(|| self.poll())
+    }
+}
+
 /// Drives one game with one policy.
 pub struct GameSession<B: AutodiffBackend> {
     pub cfg: Config,
@@ -263,6 +493,22 @@ pub struct GameSession<B: AutodiffBackend> {
 
     pub env_seconds: f64,
     pub update_seconds: f64,
+    /// Set once `run()` has started the learning worker: from then on training
+    /// happens off the control loop and never blocks it.
+    learn_offloaded: bool,
+    learn_worker: Option<LearnWorker<B>>,
+    /// Rollouts collected while the worker was still busy, and therefore not
+    /// trained on. The reason `trainer.updates` can lag the collector.
+    learn_skipped: u64,
+    /// Finished updates that a newer one superseded before the session could
+    /// apply them. Should stay at zero: only one job is ever outstanding, so
+    /// this is a backstop that says so if the accounting ever drifts.
+    learn_superseded: u64,
+    /// Updates the worker finished and the session accepted.
+    learn_updates: u64,
+    /// Set when the worker produced non-finite weights, which stops it being
+    /// applied. The run continues on the last good weights.
+    learn_disabled_after_nan: bool,
     pub episodes: u64,
     pub decisions_made: u64,
     pub total_steps: u64,
@@ -336,6 +582,12 @@ impl<B: AutodiffBackend> GameSession<B> {
             pending_has_prediction: false,
             env_seconds: 0.0,
             update_seconds: 0.0,
+            learn_offloaded: false,
+            learn_worker: None,
+            learn_skipped: 0,
+            learn_superseded: 0,
+            learn_updates: 0,
+            learn_disabled_after_nan: false,
             episodes: 0,
             decisions_made: 0,
             total_steps: 0,
@@ -456,6 +708,10 @@ impl<B: AutodiffBackend> GameSession<B> {
     /// `control` is the thing that can pause, checkpoint and stop the run; a run
     /// with no control simply goes until its budget is spent. `save_fn` is called
     /// when a checkpoint is due.
+    ///
+    /// Collection and training run on different threads here: the update is
+    /// handed to a worker and the next rollout starts immediately, so the bot
+    /// never stops playing while it learns.
     pub fn run(
         &mut self,
         mut control: Option<&mut dyn crate::control::Control>,
@@ -471,6 +727,13 @@ impl<B: AutodiffBackend> GameSession<B> {
         // Per the focus policy this never happens again on its own.
         self.focus();
         self.reset(Some(self.cfg.seed), false);
+        self.start_learning_worker();
+        if !self.learning_is_offloaded() {
+            println!(
+                "[Learn] The training thread could not be started, so updates will run \
+                 inline and the bot will pause while it learns."
+            );
+        }
         let mut last_status = self.total_steps;
 
         while max_decisions.is_none_or(|max| self.total_steps < max) {
@@ -565,11 +828,25 @@ impl<B: AutodiffBackend> GameSession<B> {
                 continue;
             }
 
+            // An update that finished while the last rollout was being collected
+            // goes in here, at the boundary: every frame of a rollout is then
+            // collected with one policy, and no frame is collected with weights
+            // the update has already replaced halfway through a window.
+            self.apply_trained_weights();
+
             self.bootstrapped_value();
-            self.learn();
+            if !self.submit_learn() {
+                // No worker (a caller driving the loop itself, or a worker that
+                // failed to start): train inline, which is the pause this exists
+                // to remove.
+                self.learn();
+            }
 
             // A NaN anywhere makes every later checkpoint worthless, so it is
-            // caught here rather than hours later.
+            // caught here rather than hours later. With training off the control
+            // thread this tests the weights still being collected with, which is
+            // the set that would poison the run; the worker's own copy is checked
+            // when it is applied.
             let bad = Trainer::<B>::nonfinite_parameters(&self.policy);
             if !bad.is_empty() {
                 let shown: Vec<&String> = bad.iter().take(3).collect();
@@ -585,6 +862,11 @@ impl<B: AutodiffBackend> GameSession<B> {
                 self.status_block();
             }
         }
+
+        // One bounded wait, so the rollout collected just before the stop is not
+        // thrown away - and only bounded: a user who asked the bot to stop must
+        // not then watch it train for another six seconds.
+        self.finish_learning();
     }
 
     // =====================================================================
@@ -958,12 +1240,182 @@ impl<B: AutodiffBackend> GameSession<B> {
     // Learning
     // =====================================================================
 
-    /// Run one PPO update over the collected rollout, then teach the
-    /// transformer's own curiosity head on the same data.
+    /// Start the learning worker, if it is not already running.
+    ///
+    /// Called by `run()`. From here on the update happens on another thread and
+    /// the control loop never waits for it. The worker is given its own policy
+    /// and the session's own `Trainer` - optimiser state included, since there is
+    /// exactly one training thread - so the two only ever meet at a weight swap.
+    pub fn start_learning_worker(&mut self) {
+        if self.learn_offloaded {
+            return;
+        }
+        let policy = self.policy.clone();
+        let trainer = std::mem::replace(&mut self.trainer, Trainer::new(&self.cfg, &self.device));
+        match LearnWorker::spawn(trainer, policy) {
+            Some(worker) => {
+                self.learn_worker = Some(worker);
+                self.learn_offloaded = true;
+            }
+            None => {
+                // The trainer went with the failed spawn, so put a fresh one
+                // back: an inline update is a pause, but a run with no update at
+                // all is a run that learns nothing.
+                self.trainer = Trainer::new(&self.cfg, &self.device);
+                self.learn_offloaded = false;
+            }
+        }
+    }
+
+    /// Whether training is running off this thread.
+    pub fn learning_is_offloaded(&self) -> bool {
+        self.learn_offloaded
+    }
+
+    /// Hand one unlocked rollout to the learning worker. `true` if it was
+    /// accepted; `false` if there is nothing to hand over, in which case the
+    /// caller falls through to [`GameSession::learn`].
+    ///
+    /// The rollout *is* the buffer, so it is moved out and replaced: collection
+    /// starts a fresh one with no gap, which is the whole point of the worker.
+    ///
+    /// At most one update is allowed to be outstanding. If the worker is still
+    /// busy, this rollout is dropped rather than queued - and dropped is the
+    /// right outcome, not the lazy one: training that cannot keep up with
+    /// collection is training on data that is further and further behind the
+    /// policy playing the game, and a queue would only make that worse while
+    /// growing without bound. The collector keeps playing throughout, which is
+    /// the property that matters.
+    pub fn submit_learn(&mut self) -> bool {
+        if self.buffer.len() < 2 {
+            return false;
+        }
+        let Some(worker) = self.learn_worker.as_mut() else {
+            return false;
+        };
+        if worker.dead {
+            return false;
+        }
+        if worker.in_flight() > 0 {
+            self.buffer.reset();
+            self.learn_skipped += 1;
+            return true;
+        }
+        let buffer = std::mem::replace(
+            &mut self.buffer,
+            RolloutBuffer::new(
+                self.cfg.rollout_steps,
+                self.cfg.embed_dim,
+                self.cfg.mem_tokens,
+                self.action_space.hold_vks.len(),
+            ),
+        );
+        // Cloned, not moved: the handles are shared, and the session keeps using
+        // these weights to collect the next rollout.
+        let weights = self.policy.net.clone();
+        worker.submit(LearnJob {
+            weights,
+            buffer,
+            last_value: self.last_value,
+        });
+        true
+    }
+
+    /// Swap in a finished update, if there is one.
+    pub fn apply_trained_weights(&mut self) {
+        // A backlog is drained and only its newest result kept: an update that a
+        // later one has already superseded is not one the policy should step
+        // through, and the collector is moving on regardless.
+        let mut latest: Option<LearnResult<B>> = None;
+        let Some(worker) = self.learn_worker.as_mut() else {
+            return;
+        };
+        if let Some(first) = worker.poll() {
+            latest = Some(first);
+        }
+        while let Some(newer) = worker.poll() {
+            self.learn_superseded += 1;
+            latest = Some(newer);
+        }
+        if let Some(result) = latest {
+            self.accept_result(result);
+        }
+    }
+
+    /// Apply one finished update and account for it.
+    fn accept_result(&mut self, result: LearnResult<B>) {
+        let bad = Trainer::<B>::nonfinite_parameters_from_net(&result.weights);
+        if !bad.is_empty() {
+            let shown: Vec<&String> = bad.iter().take(3).collect();
+            self.learn_disabled_after_nan = true;
+            println!(
+                "[Health] The training thread produced non-finite weights in {shown:?}; its \
+                 output is being discarded."
+            );
+            return;
+        }
+        self.apply_net(result.weights);
+        self.update_seconds += result.seconds;
+        // The trainer itself lives on the learning thread, so what it reports is
+        // mirrored here: the status block is printed from this one, and a status
+        // line describing the last update the *session* applied is the honest
+        // one.
+        self.trainer.last_metrics = result.metrics.clone();
+        self.trainer.last_update_seconds = result.seconds;
+        self.trainer.updates = result.updates;
+        self.write_log_line(&result.metrics);
+        self.learn_updates += 1;
+    }
+
+    /// Wait a bounded time for the update already in flight, so the last rollout
+    /// is not thrown away when the run stops.
+    pub fn finish_learning(&mut self) {
+        let Some(worker) = self.learn_worker.as_mut() else {
+            return;
+        };
+        if worker.dead {
+            return;
+        }
+        let timeout = std::time::Duration::from_secs_f64(
+            (self.cfg.update_seconds_budget.max(0.0) as f64).min(2.0),
+        );
+        let Some(result) = worker.wait_for_update(timeout) else {
+            return;
+        };
+        self.accept_result(result);
+    }
+
+    /// Apply weights the worker trained, without restarting the collection copy's
+    /// non-parameter state.
+    ///
+    /// The mouse step belongs to the session, not the optimiser: the worker's
+    /// copy of it was taken when the job was handed over, and the session may
+    /// have moved it since.
+    fn apply_net(&mut self, net: Net<B>) {
+        let mouse_step = self.policy.mouse_step;
+        self.policy.net = net;
+        self.policy.mouse_step = mouse_step;
+        self.refresh_acting();
+    }
+
+    /// True while an update is in flight on the worker.
+    pub fn learning_in_flight(&self) -> bool {
+        self.learn_worker
+            .as_ref()
+            .is_some_and(|worker| !worker.dead && worker.in_flight() > 0)
+    }
+
+    /// Train a rollout on this thread.
+    ///
+    /// Kept because `--selftest` drives the session step by step and wants each
+    /// update finished before it measures - and because a synchronous reference
+    /// path is what makes the worker's arithmetic checkable. The run loop uses
+    /// [`GameSession::submit_learn`] instead, so that it never blocks here.
     pub fn learn(&mut self) -> HashMap<String, f32> {
         if self.buffer.len() < 2 {
             return HashMap::new();
         }
+        self.learn_offloaded = false;
         let started = Instant::now();
         let mut metrics = self
             .trainer
@@ -1141,6 +1593,42 @@ impl<B: AutodiffBackend> GameSession<B> {
             self.episodes
         );
         println!("          {}", self.trainer.status_line());
+        if self.learn_offloaded {
+            let in_flight = self
+                .learn_worker
+                .as_ref()
+                .map(|worker| worker.in_flight())
+                .unwrap_or(0);
+            let behind = if self.learn_skipped == 0 {
+                String::new()
+            } else {
+                format!(
+                    ", {} rollout(s) dropped because training was still busy",
+                    self.learn_skipped
+                )
+            };
+            println!(
+                "          learning on its own thread: {} update(s) applied, {} in flight{behind}",
+                self.learn_updates, in_flight
+            );
+            if self.learn_disabled_after_nan {
+                println!(
+                    "          [Health] The last update produced non-finite weights and was \
+                     discarded; training continues from the last good set."
+                );
+            }
+            if self.learn_superseded > 0 {
+                // Only one update is ever outstanding, so this cannot happen
+                // through the session's own accounting - which is exactly why it
+                // is worth saying when it does.
+                println!(
+                    "          [Health] {} update(s) finished with a newer one already \
+                     waiting. Training is running further ahead of collection than the \
+                     loop expects.",
+                    self.learn_superseded
+                );
+            }
+        }
         println!(
             "          {}  | resets {} (last: {}), {} new states/1000 steps, {}% of \
              steps pressed something",
@@ -1201,12 +1689,18 @@ impl<B: AutodiffBackend> GameSession<B> {
             println!("          {message}");
         }
         if self.trainer.last_update_seconds > self.cfg.slow_update_seconds as f64 {
+            let advice = if self.learn_offloaded {
+                "It no longer stalls collection - it is on its own thread - but it is \
+                 still competing for the same CPU, so a long update costs frames instead \
+                 of freezing them. Lower rollout_steps, minibatch_size or seq_len, or \
+                 raise update_seconds_budget if the machine can spare it."
+            } else {
+                "Lower rollout_steps, minibatch_size or seq_len, or raise \
+                 update_seconds_budget if the machine can spare it."
+            };
             println!(
-                "          [Health] The last update took {:.1}s ({:.0}% of wall clock is \
-                 training). Lower rollout_steps, minibatch_size or seq_len, or raise \
-                 update_seconds_budget if the machine can spare it.",
-                self.trainer.last_update_seconds,
-                100.0 - env_share
+                "          [Health] The last update took {:.1}s. {advice}",
+                self.trainer.last_update_seconds
             );
         }
         self.health.start_window();
@@ -1306,4 +1800,265 @@ fn categorical_log_prob<B: Backend>(logits: &Tensor<B, 2>, index: usize) -> f32 
     (exps.get(index).copied().unwrap_or(0.0) / total)
         .max(1e-45)
         .ln()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use burn::backend::{Autodiff, Flex};
+
+    type TestBackend = Autodiff<Flex>;
+
+    /// A session on the synthetic game, with a rollout short enough to fill in a
+    /// test's worth of steps.
+    fn synthetic_session(rollout_steps: usize) -> GameSession<TestBackend> {
+        let device = Default::default();
+        let cfg = crate::synth::synthetic_train_config(48, rollout_steps, 7);
+        let env = crate::synth::SyntheticEnv::new(&cfg, 60, 300);
+        GameSession::<TestBackend>::new(
+            &cfg,
+            Box::new(env),
+            crate::synth::synthetic_action_space(&cfg),
+            None,
+            device,
+        )
+        .expect("a synthetic session")
+    }
+
+    /// One rollout's worth of real transitions, so the update has data that is
+    /// not degenerate.
+    fn fill_rollout(session: &mut GameSession<TestBackend>) {
+        session.reset(Some(1), false);
+        while session.buffer.len() < session.cfg.rollout_steps {
+            let action = session.decide();
+            let (_reward, done, _info) = session.step(&action);
+            if done {
+                session.reset(None, true);
+            }
+        }
+    }
+
+    /// Poll the session until the in-flight update has been applied. Generous,
+    /// because a cold CPU backend's first update is its slowest.
+    fn wait_for_one_update(session: &mut GameSession<TestBackend>) {
+        let deadline = Instant::now() + std::time::Duration::from_secs(300);
+        while session.learn_updates == 0 {
+            session.apply_trained_weights();
+            if session.learn_updates > 0 {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the learning worker produced nothing in five minutes"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    }
+
+    /// The whole point of the worker: `learn()` blocks the calling thread, and
+    /// `submit_learn()` must not.
+    #[test]
+    fn submitting_an_update_does_not_train_on_the_calling_thread() {
+        let mut session = synthetic_session(64);
+        fill_rollout(&mut session);
+        session.bootstrapped_value();
+        session.start_learning_worker();
+        assert!(session.learning_is_offloaded());
+
+        let before = session.policy.net.clone();
+        let started = Instant::now();
+        assert!(session.submit_learn(), "the rollout should be accepted");
+        let submission = started.elapsed();
+
+        // Training starts from the weights the rollout was collected with, so
+        // nothing about the session's own policy may change here.
+        assert_eq!(
+            session.policy.net.bos.val().into_data().to_vec::<f32>().unwrap(),
+            before.bos.val().into_data().to_vec::<f32>().unwrap(),
+            "the collection weights must not move while the update is in flight"
+        );
+        // The synchronous path on the same data takes far longer than a channel
+        // send; this is the property that removes the pause, so it is asserted
+        // rather than assumed.
+        assert!(
+            submission < std::time::Duration::from_millis(200),
+            "submitting must not train on the collecting thread (took {submission:?})"
+        );
+        // And the buffer is free again, so collection carries straight on.
+        assert_eq!(session.buffer.len(), 0);
+        assert_eq!(session.buffer.capacity, 64);
+
+        // The worker does eventually produce weights, and the session takes them.
+        wait_for_one_update(&mut session);
+        assert_eq!(session.learn_updates, 1, "the update should have landed");
+        assert!(!session.learning_in_flight());
+    }
+
+    /// A fingerprint of every policy parameter.
+    ///
+    /// One element is not enough to tell whether an update happened: a single
+    /// gradient step moves a weight by ~1e-7, which is real but below the
+    /// precision a lone `f32` shows once the optimiser has rounded it. Summing
+    /// the whole tree makes that movement visible while staying comparable
+    /// exactly between two runs that did identical arithmetic.
+    fn weight_fingerprint(session: &GameSession<TestBackend>) -> f64 {
+        session
+            .policy
+            .to_weights()
+            .iter()
+            .flat_map(|(_, _, values)| values.iter())
+            .map(|value| *value as f64)
+            .sum()
+    }
+
+    /// The worker must not quietly do nothing, or quietly do something else.
+    #[test]
+    fn the_worker_updates_the_same_weights_the_inline_path_would() {
+        let inline = {
+            let mut session = synthetic_session(64);
+            fill_rollout(&mut session);
+            session.bootstrapped_value();
+            let before = weight_fingerprint(&session);
+            session.learn();
+            let after = weight_fingerprint(&session);
+            assert!(
+                (after - before).abs() > 0.0,
+                "an inline update must move the weights"
+            );
+            after
+        };
+
+        let offloaded = {
+            let mut session = synthetic_session(64);
+            fill_rollout(&mut session);
+            session.bootstrapped_value();
+            session.start_learning_worker();
+            assert!(session.submit_learn());
+            wait_for_one_update(&mut session);
+            weight_fingerprint(&session)
+        };
+
+        assert_eq!(
+            inline, offloaded,
+            "a rollout collected and trained under the same seed must produce the \
+             same weights whether it is updated on the control thread or a worker"
+        );
+    }
+
+    /// The loop the real run uses, driven for several rollouts: the collector
+    /// must keep playing the whole time, and the weights it plays with must stay
+    /// finite and keep moving.
+    #[test]
+    fn collection_continues_while_updates_are_in_flight() {
+        let mut session = synthetic_session(32);
+        session.start_learning_worker();
+
+        let mut submissions = 0usize;
+        let mut applied = 0usize;
+        let mut dropped = 0usize;
+        let mut previous = weight_fingerprint(&session);
+        for round in 0..6 {
+            fill_rollout(&mut session);
+            session.bootstrapped_value();
+            if session.submit_learn() {
+                submissions += 1;
+            } else {
+                // The worker was still busy, so the rollout was let go rather
+                // than queued: the queue is bounded by design.
+                dropped += 1;
+            }
+
+            // The point of the whole change: frames keep being collected while an
+            // update runs on the other thread.
+            let steps_before = session.total_steps;
+            for _ in 0..8 {
+                let action = session.decide();
+                let (_reward, done, _info) = session.step(&action);
+                if done {
+                    session.reset(None, true);
+                }
+            }
+            assert!(
+                session.total_steps >= steps_before + 8,
+                "collection must not stall while an update is in flight"
+            );
+
+            // Let the worker land, then apply it at a rollout boundary, exactly
+            // as `run()` does.
+            let deadline = Instant::now() + std::time::Duration::from_secs(300);
+            while session.learning_in_flight() {
+                assert!(Instant::now() < deadline, "an update never finished");
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            session.apply_trained_weights();
+
+            let bad = Trainer::<TestBackend>::nonfinite_parameters(&session.policy);
+            assert!(bad.is_empty(), "round {round} produced non-finite weights: {bad:?}");
+
+            if session.learn_updates as usize > applied {
+                let now = weight_fingerprint(&session);
+                assert!(now.is_finite(), "round {round}: fingerprint {now} is not finite");
+                assert!(
+                    (now - previous).abs() > 0.0,
+                    "round {round}: applying an update must move the weights"
+                );
+                previous = now;
+                applied = session.learn_updates as usize;
+            }
+        }
+        assert!(submissions > 0, "no rollout was ever submitted");
+        assert!(applied > 0, "the worker never applied an update");
+        assert!(
+            applied <= submissions,
+            "the worker applied more updates ({applied}) than were submitted ({submissions})"
+        );
+        assert_eq!(
+            session.learn_skipped as usize, dropped,
+            "every rollout refused by the bounded queue must be reported as dropped"
+        );
+    }
+
+    /// The parts of the fix that stay on the control loop have to be cheap, or
+    /// the pause just moves rather than disappears.
+    ///
+    /// Two things still run there: the policy clone that gives the worker its
+    /// starting weights (per update) and `to_weights`, which copies the
+    /// parameters out for a checkpoint (per checkpoint). Both are on the loop, so
+    /// both are measured rather than assumed - the assumption being that Burn's
+    /// parameters are behind `Arc` handles, which a few thousand `Arc` increments
+    /// would confirm and a deep copy would refute.
+    #[test]
+    fn the_work_left_on_the_control_loop_is_cheap() {
+        let session = synthetic_session(64);
+
+        let started = Instant::now();
+        let clone = session.policy.clone();
+        let clone_seconds = started.elapsed().as_secs_f64();
+        // Keep it alive so the clone is not optimised away.
+        assert!(clone.net.bos.val().dims()[0] == 1);
+
+        // Warm the allocator, then time the real thing.
+        let _ = session.policy.to_weights();
+        let started = Instant::now();
+        let tensors = session.policy.to_weights();
+        let weights_seconds = started.elapsed().as_secs_f64();
+
+        println!(
+            "  policy clone {:.3}ms, to_weights {:.3}ms ({} tensors)",
+            clone_seconds * 1000.0,
+            weights_seconds * 1000.0,
+            tensors.len()
+        );
+        assert!(
+            clone_seconds < 0.010,
+            "the worker's starting weights must be a handle copy, not a weight copy \
+             (took {:.1}ms)",
+            clone_seconds * 1000.0
+        );
+        assert!(
+            weights_seconds < 0.100,
+            "copying the weights for a checkpoint must not stall the loop (took {:.1}ms)",
+            weights_seconds * 1000.0
+        );
+    }
 }
